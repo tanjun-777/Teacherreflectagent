@@ -4,8 +4,20 @@ import { useState, useRef, useEffect, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 
+const DOC_EXTENSIONS = ['txt', 'pdf', 'docx'] as const
+
+function getFileExt(name: string) {
+  const ext = name.split('.').pop()
+  return String(ext ?? '').toLowerCase()
+}
+
+function isDocFile(name: string) {
+  return DOC_EXTENSIONS.includes(getFileExt(name) as typeof DOC_EXTENSIONS[number])
+}
+
 // ─── 录音输入组件 ─────────────────────────────────────────────
 type AudioInputMode = 'text' | 'record'
+
 
 interface AudioTextFieldProps {
   label: string
@@ -14,15 +26,20 @@ interface AudioTextFieldProps {
   placeholder: string
   audioBlob: Blob | null
   onAudioBlob: (b: Blob | null) => void
+  docFile: File | null
+  onDocFile: (f: File | null) => void
 }
 
-function AudioTextField({ label, value, onChange, placeholder, audioBlob, onAudioBlob }: AudioTextFieldProps) {
+function AudioTextField({ label, value, onChange, placeholder, audioBlob, onAudioBlob, docFile, onDocFile }: AudioTextFieldProps) {
+
   const [mode, setMode] = useState<AudioInputMode>('text')
   const [recording, setRecording] = useState(false)
   const [recSeconds, setRecSeconds] = useState(0)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const docRef = useRef<HTMLInputElement>(null)
+
 
   function startTimer() {
     setRecSeconds(0)
@@ -87,12 +104,32 @@ function AudioTextField({ label, value, onChange, placeholder, audioBlob, onAudi
       </div>
 
       {mode === 'text' ? (
-        <textarea
-          value={value} onChange={e => onChange(e.target.value)}
-          rows={4} placeholder={placeholder}
-          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
-        />
+        <div>
+          <textarea
+            value={value} onChange={e => onChange(e.target.value)}
+            rows={4} placeholder={placeholder}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+          />
+          <div className="mt-2 flex items-center gap-3 text-sm">
+            <input
+              ref={docRef}
+              type="file"
+              accept=".docx,.pdf,.txt"
+              className="hidden"
+              onChange={e => onDocFile(e.target.files?.[0] ?? null)}
+            />
+            <button type="button" onClick={() => docRef.current?.click()} className="text-blue-600 hover:underline">
+              {docFile ? `已选择: ${docFile.name}` : '+ 上传文档（.docx/.pdf/.txt）'}
+            </button>
+            {docFile && (
+              <button type="button" onClick={() => onDocFile(null)} className="text-gray-500 hover:underline">
+                清除
+              </button>
+            )}
+          </div>
+        </div>
       ) : (
+
         <div className="border border-gray-300 rounded-lg p-4 space-y-3 bg-gray-50">
           {/* 录音控制 */}
           <div className="flex items-center gap-3">
@@ -204,8 +241,9 @@ function ClassAudioInput({ file, onFile, blob, onBlob }: ClassAudioInputProps) {
       <div className="flex items-center justify-between mb-2">
         <label className="block text-sm font-medium text-gray-700">
           课堂录音
-          <span className="text-gray-400 font-normal ml-2">（≤ 100 MB）</span>
+          <span className="text-gray-400 font-normal ml-2">（音频 ≤ 100 MB，或上传文本文档）</span>
         </label>
+
         <div className="flex rounded-md overflow-hidden border border-gray-300 text-xs">
           {(['file', 'record'] as ClassAudioMode[]).map(m => (
             <button key={m} type="button" onClick={() => setMode(m)}
@@ -218,13 +256,15 @@ function ClassAudioInput({ file, onFile, blob, onBlob }: ClassAudioInputProps) {
 
       {mode === 'file' ? (
         <>
-          <input ref={fileRef} type="file" accept="audio/*" className="hidden"
+          <input ref={fileRef} type="file" accept="audio/*,.docx,.pdf,.txt" className="hidden"
             onChange={e => onFile(e.target.files?.[0] ?? null)} />
+
           <button type="button" onClick={() => fileRef.current?.click()}
             className="flex items-center gap-2 border border-dashed border-gray-300 rounded-lg px-4 py-3 text-sm text-gray-500 hover:border-blue-400 hover:text-blue-600 transition-colors w-full justify-center">
             {file
               ? `已选择: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)`
-              : '点击选择音频文件（mp3 / m4a / wav）'}
+              : '点击选择音频文件或文档（mp3/m4a/wav 或 .docx/.pdf/.txt）'}
+
           </button>
         </>
       ) : (
@@ -283,6 +323,9 @@ export default function NewSessionPage() {
   // 录音 blob（自评 / 同伴评价）
   const [selfReviewBlob, setSelfReviewBlob] = useState<Blob | null>(null)
   const [peerReviewBlob, setPeerReviewBlob] = useState<Blob | null>(null)
+  const [selfReviewDocFile, setSelfReviewDocFile] = useState<File | null>(null)
+  const [peerReviewDocFile, setPeerReviewDocFile] = useState<File | null>(null)
+
 
   const [form, setForm] = useState({
     title: '',
@@ -339,7 +382,39 @@ export default function NewSessionPage() {
     return data.publicUrl
   }
 
+  async function uploadDocAndExtractText(file: File, userId: string, prefix: string, label: string) {
+    const ext = getFileExt(file.name)
+    if (ext === 'doc') {
+      throw new Error(`${label}暂不支持 .doc 格式，请转换为 .docx / .pdf / .txt 后再上传。`)
+    }
+    if (!isDocFile(file.name)) {
+      throw new Error(`${label}仅支持 .docx / .pdf / .txt 文件。`)
+    }
+
+    const path = `${userId}/${prefix}_${Date.now()}.${ext || 'bin'}`
+    const { error: upErr } = await supabase.storage.from('doc-uploads').upload(path, file)
+    if (upErr) throw new Error(getStorageUploadErrorMessage(upErr, 'doc-uploads'))
+    const { data: urlData } = supabase.storage.from('doc-uploads').getPublicUrl(path)
+
+    const extractRes = await fetch('/api/document-extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: urlData.publicUrl, fileName: file.name }),
+    })
+
+    if (!extractRes.ok) {
+      const payload = await extractRes.json().catch(() => null) as { error?: string } | null
+      throw new Error(payload?.error ?? `${label}文档解析失败`)
+    }
+
+    const payload = await extractRes.json() as { text?: string }
+    const extracted = String(payload.text ?? '').trim()
+    if (!extracted) throw new Error(`${label}未提取到有效文本，请检查文档内容`)
+    return { text: extracted, url: urlData.publicUrl }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
+
     e.preventDefault()
     if (!form.title.trim()) { setError('请填写反思标题'); return }
     setError('')
@@ -348,16 +423,25 @@ export default function NewSessionPage() {
       const { data: { user } } = await supabase.auth.getUser()
       if (!user) throw new Error('未登录')
 
-      // 上传课堂录音（文件 or 现场录音 blob）
+      // 上传课堂录音（音频文件 / 现场录音 / 文本文档）
       let audio_url: string | undefined
+      let audio_transcript: string | undefined
       if (classAudioFile) {
-        if (classAudioFile.size > 100 * 1024 * 1024) throw new Error('音频文件不超过 100MB')
-        const ext = classAudioFile.name.split('.').pop()
-        const path = `${user.id}/${Date.now()}.${ext}`
-        const { error: upErr } = await supabase.storage.from('audio-uploads').upload(path, classAudioFile)
-        if (upErr) throw new Error(getStorageUploadErrorMessage(upErr, 'audio-uploads'))
-        const { data: urlData } = supabase.storage.from('audio-uploads').getPublicUrl(path)
-        audio_url = urlData.publicUrl
+        if (isDocFile(classAudioFile.name)) {
+          const extracted = await uploadDocAndExtractText(classAudioFile, user.id, 'class_text', '课堂录音文本')
+          audio_transcript = [
+            `【文档解析：${classAudioFile.name}】`,
+            extracted.text,
+          ].join('\n\n')
+        } else {
+          if (classAudioFile.size > 100 * 1024 * 1024) throw new Error('音频文件不超过 100MB')
+          const ext = getFileExt(classAudioFile.name)
+          const path = `${user.id}/${Date.now()}.${ext || 'bin'}`
+          const { error: upErr } = await supabase.storage.from('audio-uploads').upload(path, classAudioFile)
+          if (upErr) throw new Error(getStorageUploadErrorMessage(upErr, 'audio-uploads'))
+          const { data: urlData } = supabase.storage.from('audio-uploads').getPublicUrl(path)
+          audio_url = urlData.publicUrl
+        }
       } else if (classAudioBlob) {
         const path = `${user.id}/class_${Date.now()}.webm`
         const { error: upErr } = await supabase.storage.from('audio-uploads').upload(path, classAudioBlob)
@@ -369,45 +453,31 @@ export default function NewSessionPage() {
       // 上传教学设计文档（如有）并提取文本用于 AI 分析
       let teaching_design = form.teaching_design
       if (docFile) {
-        const ext = (docFile.name.split('.').pop() ?? '').toLowerCase()
-        if (ext === 'doc') {
-          throw new Error('暂不支持 .doc 格式，请转换为 .docx / .pdf / .txt 后再上传。')
-        }
-
-        const path = `${user.id}/doc_${Date.now()}.${ext || 'bin'}`
-        const { error: upErr } = await supabase.storage.from('doc-uploads').upload(path, docFile)
-        if (upErr) throw new Error(getStorageUploadErrorMessage(upErr, 'doc-uploads'))
-        const { data: urlData } = supabase.storage.from('doc-uploads').getPublicUrl(path)
-
-        const extractRes = await fetch('/api/document-extract', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: urlData.publicUrl, fileName: docFile.name }),
-        })
-
-        if (extractRes.ok) {
-          const payload = await extractRes.json() as { text?: string }
-          const extracted = String(payload.text ?? '').trim()
-          if (extracted) {
-            teaching_design = [teaching_design.trim(), `【文档解析：${docFile.name}】`, extracted]
-              .filter(Boolean)
-              .join('\n\n')
-          }
-        } else {
-          const payload = await extractRes.json().catch(() => null) as { error?: string } | null
-          if (!teaching_design.trim()) {
-            throw new Error(payload?.error ?? '文档已上传，但解析失败。请粘贴教学设计文本后重试。')
-          }
-          teaching_design = `[文档] ${urlData.publicUrl}\n\n${teaching_design}`
-        }
+        const extracted = await uploadDocAndExtractText(docFile, user.id, 'doc', '教学设计文档')
+        teaching_design = [teaching_design.trim(), `【文档解析：${docFile.name}】`, extracted.text]
+          .filter(Boolean)
+          .join('\n\n')
       }
 
+      // 上传自评/同伴评价录音或文档
 
-      // 上传自评/同伴评价录音 → 转文字
       let self_review = form.self_review
       let peer_review = form.peer_review
       let self_review_audio_url: string | undefined
       let peer_review_audio_url: string | undefined
+
+      if (selfReviewDocFile) {
+        const extracted = await uploadDocAndExtractText(selfReviewDocFile, user.id, 'self_review', '教师自评文档')
+        self_review = [self_review.trim(), `【文档解析：${selfReviewDocFile.name}】`, extracted.text]
+          .filter(Boolean)
+          .join('\n\n')
+      }
+      if (peerReviewDocFile) {
+        const extracted = await uploadDocAndExtractText(peerReviewDocFile, user.id, 'peer_review', '同伴评价文档')
+        peer_review = [peer_review.trim(), `【文档解析：${peerReviewDocFile.name}】`, extracted.text]
+          .filter(Boolean)
+          .join('\n\n')
+      }
 
       if (selfReviewBlob) {
         self_review_audio_url = await uploadAudioBlob(selfReviewBlob, user.id, 'self')
@@ -415,6 +485,7 @@ export default function NewSessionPage() {
       if (peerReviewBlob) {
         peer_review_audio_url = await uploadAudioBlob(peerReviewBlob, user.id, 'peer')
       }
+
 
       // 插入反思会话记录
       const { data: session, error: insErr } = await supabase
@@ -430,6 +501,8 @@ export default function NewSessionPage() {
           self_review: self_review || null,
           peer_review: peer_review || null,
           audio_url: audio_url ?? null,
+          audio_transcript: audio_transcript ?? null,
+
           draft_snapshot: (self_review_audio_url || peer_review_audio_url) ? {
             self_review_audio_url: self_review_audio_url ?? null,
             peer_review_audio_url: peer_review_audio_url ?? null,
@@ -529,7 +602,10 @@ export default function NewSessionPage() {
             placeholder="描述本节课的教学过程，自认为的亮点与不足…"
             audioBlob={selfReviewBlob}
             onAudioBlob={setSelfReviewBlob}
+            docFile={selfReviewDocFile}
+            onDocFile={setSelfReviewDocFile}
           />
+
 
           {/* 同伴评价：文本 + 录音 */}
           <AudioTextField
@@ -539,7 +615,10 @@ export default function NewSessionPage() {
             placeholder="粘贴同事、导师的听课评价意见…"
             audioBlob={peerReviewBlob}
             onAudioBlob={setPeerReviewBlob}
+            docFile={peerReviewDocFile}
+            onDocFile={setPeerReviewDocFile}
           />
+
 
           {/* 课堂录音：选择文件 or 现场录音 */}
           <ClassAudioInput

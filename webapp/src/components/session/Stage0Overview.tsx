@@ -16,8 +16,9 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
     peer_review_audio_url?: string
   }
 
-  const hasData = session.teaching_design || session.self_review || session.peer_review || session.audio_url
+  const hasData = session.teaching_design || session.self_review || session.peer_review || session.audio_url || session.audio_transcript
     || snapshot.self_review_audio_url || snapshot.peer_review_audio_url
+
 
   const selfAudioPending = !!snapshot.self_review_audio_url && !session.self_review
   const peerAudioPending = !!snapshot.peer_review_audio_url && !session.peer_review
@@ -82,13 +83,16 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
               <p className="text-sm font-medium text-gray-700">课堂录音</p>
               {session.audio_url ? (
                 <p className="text-sm text-blue-600 mt-0.5">已上传{session.audio_transcript ? '（已转写）' : '（将异步转写）'}</p>
+              ) : session.audio_transcript ? (
+                <p className="text-sm text-blue-600 mt-0.5">已上传文本版记录</p>
               ) : (
                 <p className="text-sm text-gray-300 mt-0.5">未上传</p>
               )}
             </div>
-            <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${session.audio_url ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-400'}`}>
-              {session.audio_url ? '已上传' : '缺失'}
+            <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${(session.audio_url || session.audio_transcript) ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-400'}`}>
+              {(session.audio_url || session.audio_transcript) ? '已上传' : '缺失'}
             </span>
+
           </div>
         </div>
       </div>
