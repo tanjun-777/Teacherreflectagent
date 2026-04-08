@@ -183,9 +183,24 @@ export default function Stage1Problems({ session, problems, setProblems, onNext,
   )
 }
 
+function getAiEvidenceSourceLabel(evidence: Array<{ text: string; source?: string }>) {
+  const sourceText = evidence
+    .map(e => `${e.source ?? ''} ${e.text}`)
+    .join(' ')
+
+  const fromTeachingDesign = /教学设计/.test(sourceText)
+  const fromClassroomRecord = /课堂录音|录音转写|课堂实录/.test(sourceText)
+
+  if (fromTeachingDesign && fromClassroomRecord) return '证据来源：教学设计/课堂实录'
+  if (fromTeachingDesign) return '证据来源：教学设计'
+  if (fromClassroomRecord) return '证据来源：课堂实录'
+  return '证据来源：AI综合判断'
+}
+
 function ProblemCard({
   problem, saving, onConfirm, onDelete, isConfirmed
 }: {
+
   problem: Problem
   saving: boolean
   onConfirm: (desc: string) => void
@@ -194,8 +209,11 @@ function ProblemCard({
 }) {
   const [desc, setDesc] = useState(problem.description)
   const evidence = (problem.evidence as Array<{ text: string; source?: string }> | null) ?? []
+  const showAiEvidenceSource = !!problem.source?.includes('ai_analysis')
+  const aiEvidenceSourceLabel = showAiEvidenceSource ? getAiEvidenceSourceLabel(evidence) : ''
 
   return (
+
     <div className={cn(
       'bg-white rounded-xl border p-4',
       isConfirmed ? 'border-green-200 bg-green-50/30' : 'border-gray-200'
@@ -207,8 +225,14 @@ function ProblemCard({
               {SOURCE_LABEL[s as SourceTag] ?? s}
             </span>
           ))}
+          {showAiEvidenceSource && (
+            <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-indigo-100 text-indigo-700">
+              {aiEvidenceSourceLabel}
+            </span>
+          )}
         </div>
       )}
+
 
       <textarea
         value={desc}
