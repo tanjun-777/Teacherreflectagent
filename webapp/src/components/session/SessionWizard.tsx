@@ -23,7 +23,7 @@ const STAGES = [
   { label: '问题识别', short: '1' },
   { label: '归因分析', short: '2' },
   { label: '改进措施', short: '3' },
-  { label: '撰写报告', short: '4' },
+  { label: '反思深化', short: '4' },
 ]
 
 type AnalyzeStage = 1 | 2 | 3 | 4

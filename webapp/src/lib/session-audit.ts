@@ -5,7 +5,7 @@ export type SessionOperationLog = {
   at: string
   stage: 1 | 2 | 3 | 4
   action: string
-  targetType: 'problem' | 'cause' | 'measure' | 'report'
+  targetType: 'problem' | 'cause' | 'measure' | 'report' | 'deepening'
   targetId?: string
   summary: string
   before?: string

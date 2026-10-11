@@ -11,8 +11,12 @@ type FinalReportPayload = {
     measure?: string
     priority?: string
   }>
-  overview?: string
-  outlook?: string
+  deepening_results?: {
+    1?: { status: string; assumptions?: Array<{ original_clue: string; explicated: string }> }
+    2?: { status: string; examinations?: Array<{ assumption: string; method: string; conclusion: string }> }
+    3?: { status: string; new_understandings?: Array<{ based_on: string; statement: string }> }
+    4?: { status: string; actions?: Array<{ context: string; time: string; method: string; expected_effect: string }> }
+  }
 }
 
 function parseFinalPayload(draftSnapshot: unknown): FinalReportPayload {
@@ -89,15 +93,57 @@ export default async function SessionPage({ params }: { params: { id: string } }
         )}
 
         <div className="bg-white border border-gray-200 rounded-xl p-5 space-y-6">
-          <section>
-            <h2 className="text-base font-semibold text-gray-900 mb-2">一、课堂概述</h2>
-            <p className="text-sm text-gray-700 whitespace-pre-line">{payload.overview || '—'}</p>
-          </section>
-          <section>
-            <h2 className="text-base font-semibold text-gray-900 mb-2">二、总结与展望</h2>
-            <p className="text-sm text-gray-700 whitespace-pre-line">{payload.outlook || '—'}</p>
-          </section>
-          {!payload.overview && !payload.outlook && (
+          {payload.deepening_results?.[1]?.status === 'completed' && (
+            <section>
+              <h2 className="text-base font-semibold text-gray-900 mb-2">Phase 1 ｜ 既有假设外显</h2>
+              {payload.deepening_results[1].assumptions?.map((a, i) => (
+                <div key={i} className="text-sm text-gray-700 mb-2">
+                  <p className="text-xs text-gray-500">假设 {i + 1}</p>
+                  <p>原文线索：{a.original_clue}</p>
+                  <p>外显表述：{a.explicated}</p>
+                </div>
+              )) ?? <p className="text-sm text-gray-500">—</p>}
+            </section>
+          )}
+          {payload.deepening_results?.[2]?.status === 'completed' && (
+            <section>
+              <h2 className="text-base font-semibold text-gray-900 mb-2">Phase 2 ｜ 批判性检视</h2>
+              {payload.deepening_results[2].examinations?.map((e, i) => (
+                <div key={i} className="text-sm text-gray-700 mb-2">
+                  <p className="text-xs text-gray-500">假设 {i + 1} 检视</p>
+                  <p>检视方式：{e.method}</p>
+                  <p>检视结论：{e.conclusion}</p>
+                </div>
+              )) ?? <p className="text-sm text-gray-500">—</p>}
+            </section>
+          )}
+          {payload.deepening_results?.[3]?.status === 'completed' && (
+            <section>
+              <h2 className="text-base font-semibold text-gray-900 mb-2">Phase 3 ｜ 新认识形成</h2>
+              {payload.deepening_results[3].new_understandings?.map((n, i) => (
+                <div key={i} className="text-sm text-gray-700 mb-2">
+                  <p className="text-xs text-gray-500">新认识 {i + 1}</p>
+                  <p>基于：{n.based_on}</p>
+                  <p>表述：{n.statement}</p>
+                </div>
+              )) ?? <p className="text-sm text-gray-500">—</p>}
+            </section>
+          )}
+          {payload.deepening_results?.[4]?.status === 'completed' && (
+            <section>
+              <h2 className="text-base font-semibold text-gray-900 mb-2">Phase 4 ｜ 行动重构</h2>
+              {payload.deepening_results[4].actions?.map((a, i) => (
+                <div key={i} className="text-sm text-gray-700 mb-2">
+                  <p className="text-xs text-gray-500">行动 {i + 1}</p>
+                  <p>情境：{a.context}</p>
+                  <p>时间：{a.time}</p>
+                  <p>方式：{a.method}</p>
+                  <p>预期效果：{a.expected_effect}</p>
+                </div>
+              )) ?? <p className="text-sm text-gray-500">—</p>}
+            </section>
+          )}
+          {(!payload.deepening_results || Object.keys(payload.deepening_results).length === 0) && (
             <section>
               <h2 className="text-base font-semibold text-gray-900 mb-2">报告原文</h2>
               <p className="text-sm text-gray-700 whitespace-pre-line">{report?.content || '暂无报告内容'}</p>

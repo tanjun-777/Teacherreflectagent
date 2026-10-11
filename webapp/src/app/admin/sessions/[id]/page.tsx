@@ -45,8 +45,12 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
       measure?: string
       priority?: string
     }>
-    overview?: string
-    outlook?: string
+    deepening_results?: {
+      1?: { status: string; assumptions?: Array<{ original_clue: string; explicated: string }> }
+      2?: { status: string; examinations?: Array<{ assumption: string; method: string; conclusion: string }> }
+      3?: { status: string; new_understandings?: Array<{ based_on: string; statement: string }> }
+      4?: { status: string; actions?: Array<{ context: string; time: string; method: string; expected_effect: string }> }
+    }
     submitted_at?: string
   } | null
 
@@ -165,8 +169,34 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
                 </tbody>
               </table>
             </div>
-            <DataBlock title="一、课堂概述" content={finalPayload.overview ?? null} />
-            <DataBlock title="三、总结与展望" content={finalPayload.outlook ?? null} />
+            <DataBlock title="Phase 1 ｜ 既有假设外显" content={
+              finalPayload.deepening_results?.[1]?.assumptions?.length
+                ? finalPayload.deepening_results[1].assumptions!.map((a, i) =>
+                    `假设${i + 1}（原文线索：${a.original_clue}）\n外显表述：${a.explicated}`
+                  ).join('\n\n')
+                : null
+            } />
+            <DataBlock title="Phase 2 ｜ 批判性检视" content={
+              finalPayload.deepening_results?.[2]?.examinations?.length
+                ? finalPayload.deepening_results[2].examinations!.map((e, i) =>
+                    `假设${i + 1}检视（${e.method}）\n检视结论：${e.conclusion}`
+                  ).join('\n\n')
+                : null
+            } />
+            <DataBlock title="Phase 3 ｜ 新认识形成" content={
+              finalPayload.deepening_results?.[3]?.new_understandings?.length
+                ? finalPayload.deepening_results[3].new_understandings!.map((n, i) =>
+                    `新认识${i + 1}（基于${n.based_on}）\n表述：${n.statement}`
+                  ).join('\n\n')
+                : null
+            } />
+            <DataBlock title="Phase 4 ｜ 行动重构" content={
+              finalPayload.deepening_results?.[4]?.actions?.length
+                ? finalPayload.deepening_results[4].actions!.map((a, i) =>
+                    `行动${i + 1}\n情境：${a.context}\n时间：${a.time}\n方式：${a.method}\n预期效果：${a.expected_effect}`
+                  ).join('\n\n')
+                : null
+            } />
           </>
         ) : (
           <DataBlock title="最终报告正文" content={report?.content || report?.ai_draft || null} />
