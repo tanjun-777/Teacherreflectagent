@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server'
 import Link from 'next/link'
+import { redirect } from 'next/navigation'
 import { formatDate } from '@/lib/utils'
 
 type RepeatedHint = {
@@ -40,21 +41,34 @@ function buildHints<T extends { session_id: string; description: string }>(
     .filter(x => x.count >= 3)
 }
 
-export default async function DashboardPage() {
+export default async function DashboardPage({ searchParams }: { searchParams: Promise<{ page?: string }> }) {
   const supabase = createClient()
   const { data: { user } } = await supabase.auth.getUser()
+  if (!user) redirect('/login')
+
+  const { page: pageParam } = await searchParams
+  const pageSize = 20
+
+  // 真实总数（此前直接显示 limit(20) 的条数，超过 20 条时统计失真）
+  const { count } = await supabase
+    .from('reflection_sessions')
+    .select('id', { count: 'exact', head: true })
+    .eq('teacher_id', user.id)
+  const total = count ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const page = Math.min(Math.max(1, parseInt(pageParam ?? '1', 10) || 1), totalPages)
 
   const { data: sessions } = await supabase
     .from('reflection_sessions')
     .select('id, title, class_date, subject, current_stage, status, updated_at')
-    .eq('teacher_id', user!.id)
+    .eq('teacher_id', user.id)
     .order('updated_at', { ascending: false })
-    .limit(20)
+    .range((page - 1) * pageSize, page * pageSize - 1)
 
   const { data: doneSessions } = await supabase
     .from('reflection_sessions')
     .select('id')
-    .eq('teacher_id', user!.id)
+    .eq('teacher_id', user.id)
     .eq('status', 'done')
 
   const doneIds = (doneSessions ?? []).map(s => s.id)
@@ -76,7 +90,7 @@ export default async function DashboardPage() {
       .slice(0, 6)
   }
 
-  const stageLabel = ['数据录入', '问题识别', '归因分析', '改进措施', '撰写报告']
+  const stageLabel = ['阶段2 · 数据概览', '阶段2 · 明确问题', '阶段2 · 归因分析', '阶段2 · 改进措施', '阶段3 · 初步教学反思审视与深化']
   const statusColor = { draft: 'bg-gray-100 text-gray-600', analyzing: 'bg-yellow-100 text-yellow-700', done: 'bg-green-100 text-green-700' }
   const statusLabel = { draft: '草稿', analyzing: 'AI 分析中', done: '已完成' }
 
@@ -85,7 +99,7 @@ export default async function DashboardPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">我的反思记录</h1>
-          <p className="text-gray-500 text-sm mt-1">共 {sessions?.length ?? 0} 条记录</p>
+          <p className="text-gray-500 text-sm mt-1">共 {total} 条记录</p>
         </div>
         <Link
           href="/dashboard/sessions/new"
@@ -134,7 +148,9 @@ export default async function DashboardPage() {
                 </p>
               </Link>
               <div className="shrink-0 text-right">
-                <p className="text-xs text-gray-400">阶段 {Math.min(s.current_stage, 4)}/4</p>
+                <p className="text-xs text-gray-400">
+                  {s.status === 'done' ? '已完成' : `阶段 ${Math.min(s.current_stage, 4) === 4 ? 3 : 2}/3`}
+                </p>
                 {s.status !== 'done' && (
                   <p className="text-xs text-blue-600 font-medium">{stageLabel[Math.min(s.current_stage, 4)]}</p>
                 )}
@@ -154,6 +170,26 @@ export default async function DashboardPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {totalPages > 1 && (
+        <div className="flex items-center justify-center gap-3 mt-5 text-sm">
+          {page > 1 ? (
+            <Link href={`/dashboard?page=${page - 1}`} className="px-3 py-1.5 rounded-lg border border-gray-200 hover:border-blue-300 text-gray-600 hover:text-blue-600 transition-colors">
+              上一页
+            </Link>
+          ) : (
+            <span className="px-3 py-1.5 rounded-lg border border-gray-100 text-gray-300">上一页</span>
+          )}
+          <span className="text-gray-500">{page} / {totalPages} 页</span>
+          {page < totalPages ? (
+            <Link href={`/dashboard?page=${page + 1}`} className="px-3 py-1.5 rounded-lg border border-gray-200 hover:border-blue-300 text-gray-600 hover:text-blue-600 transition-colors">
+              下一页
+            </Link>
+          ) : (
+            <span className="px-3 py-1.5 rounded-lg border border-gray-100 text-gray-300">下一页</span>
+          )}
         </div>
       )}
     </div>

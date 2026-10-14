@@ -1,4 +1,7 @@
 import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { isAllowedMediaUrl } from '@/lib/url-guard'
+import { signOwnedStorageUrl } from '@/lib/storage-sign'
 
 export const runtime = 'nodejs'
 
@@ -24,6 +27,11 @@ function getExt(fileName?: string) {
 
 export async function POST(request: Request) {
   try {
+    // 登录校验：文档解析需为已登录教师
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
     const { url, fileName } = (await request.json()) as ExtractReq
     if (!url) return NextResponse.json({ error: '缺少文档地址' }, { status: 400 })
 
@@ -32,9 +40,16 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: '仅支持解析 .txt / .pdf / .docx 文档，请先转换后再上传。' }, { status: 400 })
     }
 
-    const fileRes = await fetch(url)
+    // 仅允许下载本站上传的文件（防 SSRF）
+    if (!isAllowedMediaUrl(url)) {
+      return NextResponse.json({ error: '仅支持解析本站上传的文件。' }, { status: 400 })
+    }
+
+    // 存储桶为私有：本站文件先换为短期签名 URL 再下载
+    const downloadUrl = await signOwnedStorageUrl(url)
+    const fileRes = await fetch(downloadUrl)
     if (!fileRes.ok) {
-      return NextResponse.json({ error: '文档下载失败，请确认文件可访问。' }, { status: 400 })
+      return NextResponse.json({ error: '文档下载失败，请重新上传后再试。' }, { status: 400 })
     }
 
     const buffer = Buffer.from(await fileRes.arrayBuffer())

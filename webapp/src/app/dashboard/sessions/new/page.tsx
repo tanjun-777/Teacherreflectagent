@@ -5,6 +5,12 @@ import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 
 const DOC_EXTENSIONS = ['txt', 'pdf', 'docx'] as const
+const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] as const
+const MAX_FIELD_FILES = 9
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024
+
+// 两步流程的本地持久化（基本信息 + 当前步骤，刷新不丢失）
+const STORAGE_KEY = 'new-reflection-wizard-v1'
 
 function getFileExt(name: string) {
   const ext = name.split('.').pop()
@@ -13,6 +19,19 @@ function getFileExt(name: string) {
 
 function isDocFile(name: string) {
   return DOC_EXTENSIONS.includes(getFileExt(name) as typeof DOC_EXTENSIONS[number])
+}
+
+function isImageFile(file: File) {
+  return IMAGE_EXTENSIONS.includes(getFileExt(file.name) as typeof IMAGE_EXTENSIONS[number])
+}
+
+// 将底层错误信息转换为教师可读的中文提示（含中文的业务提示原样返回）
+function friendlyCreateError(raw: string) {
+  if (/[\u4e00-\u9fa5]/.test(raw)) return raw
+  if (/duplicate key/i.test(raw)) return '该记录可能已创建，请返回反思记录列表查看后重试'
+  if (/failed to fetch|networkerror|network/i.test(raw)) return '网络连接失败，请检查网络后重试'
+  if (/jwt|token|401/i.test(raw)) return '登录状态已失效，请重新登录后再试'
+  return `保存失败：${raw}`
 }
 
 // ─── 录音输入组件 ─────────────────────────────────────────────
@@ -85,6 +104,10 @@ function AudioTextField({ label, value, onChange, placeholder, audioBlob, onAudi
   useEffect(() => () => stopTimer(), [])
 
   const fmtTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+
+  // 录音预览地址：memoize + 卸载/替换时 revoke，避免 object URL 泄漏
+  const previewUrl = useMemo(() => (audioBlob ? URL.createObjectURL(audioBlob) : null), [audioBlob])
+  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl) }, [previewUrl])
 
   return (
     <div>
@@ -164,8 +187,8 @@ function AudioTextField({ label, value, onChange, placeholder, audioBlob, onAudi
             )}
           </div>
           {/* 录音后可播放预览 */}
-          {audioBlob && (
-            <audio controls src={URL.createObjectURL(audioBlob)} className="w-full h-8" />
+          {previewUrl && (
+            <audio controls src={previewUrl} className="w-full h-8" />
           )}
           <p className="text-xs text-gray-400">录音将在「保存并进入分析」时自动转换为文字</p>
         </div>
@@ -204,6 +227,10 @@ function ClassAudioInput({ file, onFile, blob, onBlob }: ClassAudioInputProps) {
 
   const fmtTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 
+  // 录音预览地址：memoize + 卸载/替换时 revoke，避免 object URL 泄漏
+  const previewUrl = useMemo(() => (blob ? URL.createObjectURL(blob) : null), [blob])
+  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl) }, [previewUrl])
+
   async function startRecording() {
     chunksRef.current = []
     onBlob(null)
@@ -240,7 +267,7 @@ function ClassAudioInput({ file, onFile, blob, onBlob }: ClassAudioInputProps) {
     <div>
       <div className="flex items-center justify-between mb-2">
         <label className="block text-sm font-medium text-gray-700">
-          课堂录音
+          课堂教学实录
           <span className="text-gray-400 font-normal ml-2">（音频 ≤ 100 MB，或上传文本文档）</span>
         </label>
 
@@ -300,7 +327,7 @@ function ClassAudioInput({ file, onFile, blob, onBlob }: ClassAudioInputProps) {
               </div>
             )}
           </div>
-          {blob && <audio controls src={URL.createObjectURL(blob)} className="w-full h-8" />}
+          {previewUrl && <audio controls src={previewUrl} className="w-full h-8" />}
           <p className="text-xs text-gray-400">录音将在「保存并进入分析」时自动转换为文字</p>
         </div>
       )}
@@ -308,19 +335,163 @@ function ClassAudioInput({ file, onFile, blob, onBlob }: ClassAudioInputProps) {
   )
 }
 
+// ─── 文本 + 文档/图片（多选，图片自动识别文字）组件 ─────────────
+interface DocImageFieldProps {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  placeholder: string
+  files: File[]
+  onFiles: (fs: File[]) => void
+}
+
+function DocImageField({ label, value, onChange, placeholder, files, onFiles }: DocImageFieldProps) {
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  function handleSelect(list: FileList | null) {
+    if (!list || list.length === 0) return
+    const next = [...files]
+    for (const f of Array.from(list)) {
+      if (next.length >= MAX_FIELD_FILES) { alert(`「${label}」最多上传 ${MAX_FIELD_FILES} 个文件`); break }
+      if (isDocFile(f.name)) {
+        next.push(f)
+      } else if (isImageFile(f)) {
+        if (f.size > MAX_IMAGE_SIZE) { alert(`图片 ${f.name} 超过 10MB，请压缩后上传`); continue }
+        next.push(f)
+      } else {
+        alert(`不支持的文件类型：${f.name}（仅支持 .docx / .pdf / .txt 或图片）`)
+      }
+    }
+    onFiles(next)
+    if (inputRef.current) inputRef.current.value = ''
+  }
+
+  return (
+    <div>
+      <label className="block text-sm font-medium text-gray-700 mb-1">
+        {label}
+        <span className="text-gray-400 font-normal ml-2">（文本，或上传文档/图片，图片自动识别文字）</span>
+      </label>
+      <textarea
+        value={value} onChange={e => onChange(e.target.value)}
+        rows={4} placeholder={placeholder}
+        className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+      />
+      <div className="mt-2 space-y-2">
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept=".docx,.pdf,.txt,image/*"
+          className="hidden"
+          onChange={e => handleSelect(e.target.files)}
+        />
+        <button type="button" onClick={() => inputRef.current?.click()} className="text-sm text-blue-600 hover:underline">
+          + 上传文档或图片（.docx/.pdf/.txt 或图片，支持多选）
+        </button>
+        {files.length > 0 && (
+          <ul className="space-y-1">
+            {files.map((f, i) => (
+              <li key={`${f.name}-${i}`} className="flex items-center gap-2 text-sm text-gray-600">
+                <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${isImageFile(f) ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
+                  {isImageFile(f) ? '图片' : '文档'}
+                </span>
+                <span className="truncate flex-1">{f.name}（{(f.size / 1024).toFixed(0)} KB）</span>
+                <button type="button" onClick={() => onFiles(files.filter((_, idx) => idx !== i))}
+                  className="text-gray-400 hover:text-red-500 shrink-0">
+                  移除
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── 步骤指示器 ────────────────────────────────────────────────
+function StepIndicator({ step }: { step: 'basic' | 'data' }) {
+  const steps = [
+    { key: 'basic', label: '基本信息' },
+    { key: 'data', label: '阶段1 数据收集与整理' },
+  ] as const
+  const currentIndex = step === 'basic' ? 0 : 1
+
+  return (
+    <div className="mb-6">
+      <div className="flex items-center gap-2">
+        {steps.map((s, i) => (
+          <div key={s.key} className="flex items-center flex-1">
+            <span
+              className={`w-7 h-7 rounded-full text-xs font-bold flex items-center justify-center shrink-0 transition-colors ${
+                i < currentIndex
+                  ? 'bg-blue-600 text-white'
+                  : i === currentIndex
+                    ? 'bg-blue-600 text-white ring-4 ring-blue-100'
+                    : 'bg-gray-100 text-gray-400'
+              }`}
+            >
+              {i < currentIndex ? '✓' : i + 1}
+            </span>
+            {i < steps.length - 1 && (
+              <div className={`flex-1 h-0.5 mx-2 ${i < currentIndex ? 'bg-blue-600' : 'bg-gray-200'}`} />
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="flex mt-1.5">
+        {steps.map((s, i) => (
+          <span key={s.key} className={`text-xs flex-1 ${i === 0 ? 'text-left' : 'text-right'} ${
+            i === currentIndex ? 'text-blue-700 font-medium' : 'text-gray-400'
+          }`}>
+            {s.label}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ─── 主页面 ─────────────────────────────────────────────────────
+type WizardStep = 'basic' | 'data'
+
+interface PersistedWizardState {
+  step: WizardStep
+  form: {
+    title: string
+    class_date: string
+    subject: string
+    grade: string
+    // 长文本字段（教学设计/自评/同伴评价/学生表现/学习结果/外部反馈）刷新不丢失
+    teaching_design: string
+    self_review: string
+    peer_review: string
+    student_performance: string
+    learning_outcomes: string
+    external_feedback: string
+  }
+}
+
 export default function NewSessionPage() {
   const supabase = useMemo(() => createClient(), [])
 
   const router = useRouter()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [step, setStep] = useState<WizardStep>('basic')
   const docRef = useRef<HTMLInputElement>(null)
+  const externalDocRef = useRef<HTMLInputElement>(null)
   const [docFile, setDocFile] = useState<File | null>(null)
+  const [externalDocFile, setExternalDocFile] = useState<File | null>(null)
   const [classAudioFile, setClassAudioFile] = useState<File | null>(null)
   const [classAudioBlob, setClassAudioBlob] = useState<Blob | null>(null)
 
-  // 录音 blob（自评 / 同伴评价）
+  // 学生表现 / 学习结果：文档 + 图片（多选）
+  const [studentPerfFiles, setStudentPerfFiles] = useState<File[]>([])
+  const [learningOutcomeFiles, setLearningOutcomeFiles] = useState<File[]>([])
+
+  // 录音 blob（教师自评 / 多主体同伴反馈）
   const [selfReviewBlob, setSelfReviewBlob] = useState<Blob | null>(null)
   const [peerReviewBlob, setPeerReviewBlob] = useState<Blob | null>(null)
   const [selfReviewDocFile, setSelfReviewDocFile] = useState<File | null>(null)
@@ -335,6 +506,9 @@ export default function NewSessionPage() {
     teaching_design: '',
     self_review: '',
     peer_review: '',
+    student_performance: '',
+    learning_outcomes: '',
+    external_feedback: '',
   })
 
   // 从 profile 自动填入学科和年级
@@ -353,6 +527,72 @@ export default function NewSessionPage() {
     }
     loadProfile()
   }, [supabase])
+
+  // 恢复上次的步骤与基本信息（刷新不丢失）
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(STORAGE_KEY)
+      if (!raw) return
+      const saved = JSON.parse(raw) as Partial<PersistedWizardState>
+      if (saved.step === 'data') setStep('data')
+      if (saved.form) {
+        setForm(f => ({
+          ...f,
+          title: saved.form?.title ?? f.title,
+          class_date: saved.form?.class_date ?? f.class_date,
+          subject: saved.form?.subject || f.subject,
+          grade: saved.form?.grade || f.grade,
+          // 长文本仅在本地为空时恢复，避免覆盖 profile 自动填充之外的新输入
+          teaching_design: f.teaching_design || saved.form?.teaching_design || '',
+          self_review: f.self_review || saved.form?.self_review || '',
+          peer_review: f.peer_review || saved.form?.peer_review || '',
+          student_performance: f.student_performance || saved.form?.student_performance || '',
+          learning_outcomes: f.learning_outcomes || saved.form?.learning_outcomes || '',
+          external_feedback: f.external_feedback || saved.form?.external_feedback || '',
+        }))
+      }
+    } catch {
+      // 忽略损坏的本地数据
+    }
+  }, [])
+
+  // 持久化步骤与基本信息
+  useEffect(() => {
+    try {
+      const persisted: PersistedWizardState = {
+        step,
+        form: {
+          title: form.title,
+          class_date: form.class_date,
+          subject: form.subject,
+          grade: form.grade,
+          teaching_design: form.teaching_design,
+          self_review: form.self_review,
+          peer_review: form.peer_review,
+          student_performance: form.student_performance,
+          learning_outcomes: form.learning_outcomes,
+          external_feedback: form.external_feedback,
+        },
+      }
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(persisted))
+    } catch {
+      // 存储不可用时静默降级
+    }
+  }, [step, form.title, form.class_date, form.subject, form.grade,
+      form.teaching_design, form.self_review, form.peer_review,
+      form.student_performance, form.learning_outcomes, form.external_feedback])
+
+  // 切换步骤后回到页面顶部
+  function goToStep(s: WizardStep) {
+    setStep(s)
+    window.scrollTo(0, 0)
+  }
+
+  function handleNextFromBasic() {
+    if (!form.title.trim()) { setError('请填写反思标题'); return }
+    setError('')
+    goToStep('data')
+  }
 
 
   function setField(k: string, v: string) {
@@ -375,6 +615,7 @@ export default function NewSessionPage() {
   // 上传录音 Blob 并返回公开 URL
 
   async function uploadAudioBlob(blob: Blob, userId: string, prefix: string): Promise<string> {
+    if (blob.size > 100 * 1024 * 1024) throw new Error('录音文件不超过 100MB，请缩短录音时长后重试')
     const path = `${userId}/${prefix}_${Date.now()}.webm`
     const { error: upErr } = await supabase.storage.from('audio-uploads').upload(path, blob)
     if (upErr) throw new Error(getStorageUploadErrorMessage(upErr, 'audio-uploads'))
@@ -413,6 +654,56 @@ export default function NewSessionPage() {
     return { text: extracted, url: urlData.publicUrl }
   }
 
+  // 上传图片并调用视觉模型识别文字
+  async function uploadImageAndExtractText(file: File, userId: string, prefix: string, label: string) {
+    if (!isImageFile(file)) {
+      throw new Error(`${label}仅支持 png / jpg / jpeg / webp / gif / bmp 格式图片。`)
+    }
+    if (file.size > MAX_IMAGE_SIZE) {
+      throw new Error(`${label}图片 ${file.name} 超过 10MB，请压缩后上传。`)
+    }
+
+    const ext = getFileExt(file.name) || 'png'
+    const path = `${userId}/${prefix}_${Date.now()}.${ext}`
+    const { error: upErr } = await supabase.storage.from('doc-uploads').upload(path, file)
+    if (upErr) throw new Error(getStorageUploadErrorMessage(upErr, 'doc-uploads'))
+    const { data: urlData } = await supabase.storage.from('doc-uploads').getPublicUrl(path)
+
+    const extractRes = await fetch('/api/image-extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: urlData.publicUrl, fileName: file.name }),
+    })
+
+    if (!extractRes.ok) {
+      const payload = await extractRes.json().catch(() => null) as { error?: string } | null
+      throw new Error(payload?.error ?? `${label}图片识别失败`)
+    }
+
+    const payload = await extractRes.json() as { text?: string }
+    const extracted = String(payload.text ?? '').trim()
+    if (!extracted) throw new Error(`${label}图片未识别到有效内容，请检查图片`)
+    return { text: extracted, url: urlData.publicUrl }
+  }
+
+  // 批量处理文档/图片文件：解析并合并为带来源标注的文本段
+  async function processCollectedFiles(files: File[], userId: string, prefix: string, label: string) {
+    const segments: string[] = []
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]
+      if (isDocFile(f.name)) {
+        const extracted = await uploadDocAndExtractText(f, userId, `${prefix}_${i}`, `${label}文档`)
+        segments.push(`【文档解析：${f.name}】\n${extracted.text}`)
+      } else if (isImageFile(f)) {
+        const extracted = await uploadImageAndExtractText(f, userId, `${prefix}_${i}`, label)
+        segments.push(`【图片识别：${f.name}】\n${extracted.text}`)
+      } else {
+        throw new Error(`${label}包含不支持的文件类型：${f.name}（仅支持 .docx / .pdf / .txt 或图片）`)
+      }
+    }
+    return segments
+  }
+
   async function handleSubmit(e: React.FormEvent) {
 
     e.preventDefault()
@@ -443,6 +734,7 @@ export default function NewSessionPage() {
           audio_url = urlData.publicUrl
         }
       } else if (classAudioBlob) {
+        if (classAudioBlob.size > 100 * 1024 * 1024) throw new Error('录音文件不超过 100MB，请缩短录音时长后重试')
         const path = `${user.id}/class_${Date.now()}.webm`
         const { error: upErr } = await supabase.storage.from('audio-uploads').upload(path, classAudioBlob)
         if (upErr) throw new Error(getStorageUploadErrorMessage(upErr, 'audio-uploads'))
@@ -486,6 +778,26 @@ export default function NewSessionPage() {
         peer_review_audio_url = await uploadAudioBlob(peerReviewBlob, user.id, 'peer')
       }
 
+      // 学生表现 / 学习结果（文档+图片）/ 外部智慧教研系统反馈
+      let student_performance = form.student_performance
+      let learning_outcomes = form.learning_outcomes
+      let external_feedback = form.external_feedback
+
+      if (studentPerfFiles.length > 0) {
+        const segments = await processCollectedFiles(studentPerfFiles, user.id, 'student_perf', '学生表现')
+        student_performance = [student_performance.trim(), ...segments].filter(Boolean).join('\n\n')
+      }
+      if (learningOutcomeFiles.length > 0) {
+        const segments = await processCollectedFiles(learningOutcomeFiles, user.id, 'learning_outcome', '学习结果')
+        learning_outcomes = [learning_outcomes.trim(), ...segments].filter(Boolean).join('\n\n')
+      }
+      if (externalDocFile) {
+        const extracted = await uploadDocAndExtractText(externalDocFile, user.id, 'external_feedback', '外部智慧教研系统反馈文档')
+        external_feedback = [external_feedback.trim(), `【文档解析：${externalDocFile.name}】`, extracted.text]
+          .filter(Boolean)
+          .join('\n\n')
+      }
+
 
       // 插入反思会话记录
       const { data: session, error: insErr } = await supabase
@@ -502,6 +814,9 @@ export default function NewSessionPage() {
           peer_review: peer_review || null,
           audio_url: audio_url ?? null,
           audio_transcript: audio_transcript ?? null,
+          student_performance: student_performance || null,
+          learning_outcomes: learning_outcomes || null,
+          external_feedback: external_feedback || null,
 
           draft_snapshot: (self_review_audio_url || peer_review_audio_url) ? {
             self_review_audio_url: self_review_audio_url ?? null,
@@ -514,9 +829,12 @@ export default function NewSessionPage() {
         .single()
 
       if (insErr) throw insErr
+      try { sessionStorage.removeItem(STORAGE_KEY) } catch { /* 忽略 */ }
       router.push(`/dashboard/sessions/${session.id}`)
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : '保存失败')
+      const raw = err instanceof Error ? err.message : String(err)
+      console.error('[新建反思] 保存失败:', err)
+      setError(friendlyCreateError(raw))
     } finally {
       setLoading(false)
     }
@@ -524,12 +842,22 @@ export default function NewSessionPage() {
 
   return (
     <div className="p-6 max-w-3xl mx-auto">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">新建反思</h1>
-        <p className="text-gray-500 text-sm mt-1">填写课程信息与原始数据，AI 将帮助你进行深度分析</p>
+      <div className="mb-4">
+        <h1 className="text-2xl font-bold text-gray-900">
+          {step === 'basic' ? '新建反思' : '阶段1 ｜ 课堂教学数据与外部反馈结果的收集与整理'}
+        </h1>
+        <p className="text-gray-500 text-sm mt-1">
+          {step === 'basic'
+            ? '第 1 步：填写课程基本信息，点击「下一步」进入数据收集与整理'
+            : '第 2 步：收集与整理课堂教学数据及外部反馈结果，保存后 AI 将帮助你进行深度分析'}
+        </p>
       </div>
 
+      <StepIndicator step={step} />
+
       <form onSubmit={handleSubmit} className="space-y-6">
+        {step === 'basic' ? (
+          <>
         {/* 基本信息 */}
         <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-4">
           <h2 className="font-semibold text-gray-900">基本信息</h2>
@@ -569,9 +897,27 @@ export default function NewSessionPage() {
           )}
         </div>
 
-        {/* 原始数据 */}
+            {error && <p className="text-red-500 text-sm">{error}</p>}
+
+            <div className="flex justify-end gap-3">
+              <button type="button" onClick={() => router.back()}
+                className="px-4 py-2.5 rounded-lg border border-gray-300 text-sm text-gray-600 hover:bg-gray-50 transition-colors">
+                取消
+              </button>
+              <button type="button" onClick={handleNextFromBasic}
+                className="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors">
+                下一步 →
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+        {/* 一、课堂教学数据收集与整理 */}
         <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-5">
-          <h2 className="font-semibold text-gray-900">原始数据</h2>
+          <div>
+            <h2 className="font-semibold text-gray-900">一、课堂教学数据收集与整理</h2>
+            <p className="text-xs text-gray-400 mt-0.5">教学设计 · 课堂教学实录 · 教师自评 · 学生表现 · 学习结果</p>
+          </div>
 
           {/* 教学设计 */}
           <div>
@@ -594,6 +940,14 @@ export default function NewSessionPage() {
             </div>
           </div>
 
+          {/* 课堂教学实录：选择音频文件 or 现场录音 */}
+          <ClassAudioInput
+            file={classAudioFile}
+            onFile={setClassAudioFile}
+            blob={classAudioBlob}
+            onBlob={setClassAudioBlob}
+          />
+
           {/* 教师自评：文本 + 录音 */}
           <AudioTextField
             label="教师自评"
@@ -606,41 +960,82 @@ export default function NewSessionPage() {
             onDocFile={setSelfReviewDocFile}
           />
 
+          {/* 学生表现：文本 + 文档/图片（图片自动识别文字） */}
+          <DocImageField
+            label="学生表现"
+            value={form.student_performance}
+            onChange={v => setField('student_performance', v)}
+            placeholder="记录学生课堂参与、互动、专注度等表现，或上传学生作业/作品照片（自动识别文字）…"
+            files={studentPerfFiles}
+            onFiles={setStudentPerfFiles}
+          />
 
-          {/* 同伴评价：文本 + 录音 */}
+          {/* 学习结果：文本 + 文档/图片（图片自动识别文字） */}
+          <DocImageField
+            label="学习结果"
+            value={form.learning_outcomes}
+            onChange={v => setField('learning_outcomes', v)}
+            placeholder="记录作业完成、测验成绩、目标达成等学习结果，或上传图片（自动识别文字）…"
+            files={learningOutcomeFiles}
+            onFiles={setLearningOutcomeFiles}
+          />
+        </div>
+
+        {/* 二、外部反馈结果的收集与整理 */}
+        <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-5">
+          <div>
+            <h2 className="font-semibold text-gray-900">二、外部反馈结果的收集与整理</h2>
+            <p className="text-xs text-gray-400 mt-0.5">多主体同伴反馈 · 外部智慧教研系统反馈</p>
+          </div>
+
+          {/* 多主体同伴反馈：文本 + 录音 */}
           <AudioTextField
-            label="同伴评价"
+            label="多主体同伴反馈"
             value={form.peer_review}
             onChange={v => setField('peer_review', v)}
-            placeholder="粘贴同事、导师的听课评价意见…"
+            placeholder="粘贴同事、导师、教研组等多主体的听课评价意见…"
             audioBlob={peerReviewBlob}
             onAudioBlob={setPeerReviewBlob}
             docFile={peerReviewDocFile}
             onDocFile={setPeerReviewDocFile}
           />
 
-
-          {/* 课堂录音：选择文件 or 现场录音 */}
-          <ClassAudioInput
-            file={classAudioFile}
-            onFile={setClassAudioFile}
-            blob={classAudioBlob}
-            onBlob={setClassAudioBlob}
-          />
+          {/* 外部智慧教研系统反馈：文本 + 文档（类同教学设计） */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              外部智慧教研系统反馈
+              <span className="text-gray-400 font-normal ml-2">（文本输入或上传文档）</span>
+            </label>
+            <textarea
+              value={form.external_feedback} onChange={e => setField('external_feedback', e.target.value)}
+              rows={4} placeholder="粘贴外部智慧教研系统生成的课堂分析报告与数据反馈内容…"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+            />
+            <div className="mt-2">
+              <input ref={externalDocRef} type="file" accept=".docx,.pdf,.txt" className="hidden"
+                onChange={e => setExternalDocFile(e.target.files?.[0] ?? null)} />
+              <button type="button" onClick={() => externalDocRef.current?.click()}
+                className="text-sm text-blue-600 hover:underline">
+                {externalDocFile ? `已选择: ${externalDocFile.name}` : '+ 上传文档（.docx/.pdf/.txt）'}
+              </button>
+            </div>
+          </div>
         </div>
 
         {error && <p className="text-red-500 text-sm">{error}</p>}
 
-        <div className="flex justify-end gap-3">
-          <button type="button" onClick={() => router.back()}
+        <div className="flex justify-between">
+          <button type="button" onClick={() => goToStep('basic')}
             className="px-4 py-2.5 rounded-lg border border-gray-300 text-sm text-gray-600 hover:bg-gray-50 transition-colors">
-            取消
+            ← 上一步
           </button>
           <button type="submit" disabled={loading}
             className="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors">
             {loading ? '保存中…' : '保存并进入分析'}
           </button>
         </div>
+          </>
+        )}
       </form>
     </div>
   )

@@ -41,6 +41,7 @@ export default function ProfilePage() {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [form, setForm] = useState({
     name: '',
+    school: '',
     subject: '',
     grade: '',
     textbook_version: '',
@@ -48,6 +49,8 @@ export default function ProfilePage() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  // 加载完成前禁用表单，防止异步 load() 返回时整体覆盖用户刚做的选择（如学科联动被冲掉）
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     async function load() {
@@ -58,11 +61,13 @@ export default function ProfilePage() {
         setProfile(data)
         setForm({
           name: data.name ?? '',
+          school: data.school ?? '',
           subject: data.subject ?? '',
           grade: data.grade ?? '',
           textbook_version: (data as Record<string, unknown>).textbook_version as string ?? '',
         })
       }
+      setLoading(false)
     }
     load()
   }, [router, supabase])
@@ -90,7 +95,8 @@ export default function ProfilePage() {
   return (
     <div className="p-6 max-w-2xl mx-auto">
       <h1 className="text-2xl font-bold text-gray-900 mb-6">个人信息</h1>
-      <form onSubmit={handleSave} className="bg-white rounded-xl border border-gray-200 p-6 space-y-4">
+      <form onSubmit={handleSave} className="bg-white rounded-xl border border-gray-200 p-6">
+        <fieldset disabled={loading} className="space-y-4">
 
         {/* 姓名 */}
         <div>
@@ -99,6 +105,17 @@ export default function ProfilePage() {
             value={form.name}
             onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
             placeholder="请输入真实姓名"
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+
+        {/* 学校 */}
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">所属学校</label>
+          <input
+            value={form.school}
+            onChange={e => setForm(f => ({ ...f, school: e.target.value }))}
+            placeholder="请输入学校名称"
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </div>
@@ -149,9 +166,10 @@ export default function ProfilePage() {
         <div className="flex justify-end">
           <button type="submit" disabled={saving}
             className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors">
-            {saving ? '保存中…' : '保存'}
+            {loading ? '加载中…' : saving ? '保存中…' : '保存'}
           </button>
         </div>
+        </fieldset>
       </form>
 
       {profile && (

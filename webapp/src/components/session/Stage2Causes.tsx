@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/client'
 import type { ReflectionSession, Problem, Cause } from '@/types'
 
 import { cn } from '@/lib/utils'
-import { appendSessionOperationLog } from '@/lib/session-audit'
+import { appendSessionOperationLog, updateDraftSnapshotFields } from '@/lib/session-audit'
 
 
 type ChatMessage = {
@@ -22,27 +22,34 @@ interface Props {
 
   setCauses: (c: Cause[] | ((prev: Cause[]) => Cause[])) => void
   onNext: () => void
-  onAnalyze: () => Promise<void>
-  analyzing: boolean
-  analysisError: string
+  // 删除归因后数据库将关联措施 cause_id 置空（on delete set null），需同步向导本地状态
+  onCauseDeleted?: (causeId: string) => void
+  // 刷新后恢复的历史对话（draft_snapshot.cause_chat_dialogue）
+  initialChatMessages?: ChatMessage[]
 }
 
-export default function Stage2Causes({ session, problems, causes, setCauses, onNext, onAnalyze, analyzing, analysisError }: Props) {
+export default function Stage2Causes({ session, problems, causes, setCauses, onNext, onCauseDeleted, initialChatMessages }: Props) {
 
 
   const supabase = createClient()
   const [saving, setSaving] = useState<string | null>(null)
+  const [analyzingId, setAnalyzingId] = useState<string | null>(null)
+  const [stageError, setStageError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const [chatError, setChatError] = useState('')
   const [chatOpen, setChatOpen] = useState(false)
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-
-    {
-      role: 'assistant',
-      content: '我是归因分析助手，我将帮助你从“现象判断”走向“因果解释”。先从这一步开始：你观察到的具体现象是什么？',
-    },
-  ])
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(
+    initialChatMessages?.length
+      ? initialChatMessages
+      : [
+        {
+          role: 'assistant',
+          content: '我是归因分析助手，我将帮助你从“现象判断”走向“因果解释”。先从这一步开始：你观察到的具体现象是什么？',
+        },
+      ]
+  )
 
   const confirmedProblems = useMemo(() => problems.filter(p => p.confirmed), [problems])
   const [focusProblemId, setFocusProblemId] = useState<string>('')
@@ -60,33 +67,44 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
 
   async function confirmCause(c: Cause, desc: string) {
     setSaving(c.id)
+    setActionError(null)
     const nextDesc = desc.trim()
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('causes')
       .update({ confirmed: true, description: nextDesc })
       .eq('id', c.id)
       .select()
       .single()
-    if (data) {
-      setCauses((prev: Cause[]) => prev.map(x => x.id === c.id ? data : x))
-      await appendSessionOperationLog(supabase, session.id, {
-        at: new Date().toISOString(),
-        stage: 2,
-        action: c.confirmed ? '修改归因' : '确认归因',
-        targetType: 'cause',
-        targetId: c.id,
-        summary: c.confirmed ? '教师修改了已确认归因描述' : '教师确认了待确认归因',
-        before: c.description,
-        after: nextDesc,
-      })
+    if (error || !data) {
+      setActionError(`归因保存失败：${error?.message ?? '未知错误'}。当前修改未生效，请重试或刷新页面。`)
+      setSaving(null)
+      return
     }
+    setCauses((prev: Cause[]) => prev.map(x => x.id === c.id ? data : x))
+    await appendSessionOperationLog(supabase, session.id, {
+      at: new Date().toISOString(),
+      stage: 2,
+      action: c.confirmed ? '修改归因' : '确认归因',
+      targetType: 'cause',
+      targetId: c.id,
+      summary: c.confirmed ? '教师修改了已确认归因描述' : '教师确认了待确认归因',
+      before: c.description,
+      after: nextDesc,
+    })
     setSaving(null)
   }
 
 
   async function deleteCause(c: Cause) {
-    await supabase.from('causes').delete().eq('id', c.id)
+    setActionError(null)
+    const { error } = await supabase.from('causes').delete().eq('id', c.id)
+    if (error) {
+      setActionError(`删除失败：${error.message}。该归因未被删除，请重试。`)
+      return
+    }
     setCauses((prev: Cause[]) => prev.filter(x => x.id !== c.id))
+    // 数据库将引用该归因的措施 cause_id 置 null，同步本地状态避免措施在界面丢失
+    onCauseDeleted?.(c.id)
     await appendSessionOperationLog(supabase, session.id, {
       at: new Date().toISOString(),
       stage: 2,
@@ -96,6 +114,76 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
       summary: '教师删除了归因条目',
       before: c.description,
     })
+  }
+
+  // 单问题按需生成归因分析线索（支持重新生成）
+  async function analyzeCausesForProblem(problem: Problem) {
+    setAnalyzingId(problem.id)
+    setStageError(null)
+    try {
+      const res = await fetch('/api/ai/analyze-causes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ problem_id: problem.id }),
+      })
+      const json = await res.json()
+      if (!res.ok) throw new Error(json.error || '归因分析失败')
+      const { data } = await supabase
+        .from('causes')
+        .select('*')
+        .eq('problem_id', problem.id)
+        .order('sort_order')
+      if (data) {
+        setCauses((prev: Cause[]) => [...prev.filter(c => c.problem_id !== problem.id), ...data])
+        await appendSessionOperationLog(supabase, session.id, {
+          at: new Date().toISOString(),
+          stage: 2,
+          action: '归因分析线索',
+          targetType: 'problem',
+          targetId: problem.id,
+          summary: `AI 针对问题及其关联证据生成了 ${json.count} 条归因线索`,
+        })
+      }
+    } catch (err) {
+      setStageError(err instanceof Error ? err.message : '归因分析失败')
+    } finally {
+      setAnalyzingId(null)
+    }
+  }
+
+  // 教师自主归因
+  async function addManualCause(problem: Problem, desc: string) {
+    const nextDesc = desc.trim()
+    if (!nextDesc) return
+    setSaving(`new-${problem.id}`)
+    setActionError(null)
+    const { data, error } = await supabase
+      .from('causes')
+      .insert({
+        session_id: session.id,
+        problem_id: problem.id,
+        description: nextDesc,
+        confirmed: true,
+        sort_order: causes.filter(c => c.problem_id === problem.id).length,
+      })
+      .select()
+      .single()
+    if (error || !data) {
+      setActionError(`新增归因失败：${error?.message ?? '未知错误'}。请重试。`)
+      setSaving(null)
+      return
+    }
+    setCauses((prev: Cause[]) => [...prev, data])
+    await appendSessionOperationLog(supabase, session.id, {
+      at: new Date().toISOString(),
+      stage: 2,
+      action: '自主归因',
+      targetType: 'cause',
+      targetId: data.id,
+      summary: '教师自主添加了归因',
+      after: nextDesc,
+    })
+    setSaving(null)
   }
 
 
@@ -133,7 +221,13 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
       if (!res.ok) throw new Error(payload?.error ?? '归因对话失败')
 
       const reply = String(payload?.reply ?? '').trim() || '我已收到。请继续提供更具体的课堂现象与证据。'
-      setChatMessages(prev => [...prev, { role: 'assistant', content: reply }])
+      const fullMessages: ChatMessage[] = [...nextMessages, { role: 'assistant', content: reply }]
+      setChatMessages(fullMessages)
+      // 持久化对话到 draft_snapshot（串行队列防并发覆盖），刷新后可恢复
+      void updateDraftSnapshotFields(supabase, session.id, snap => ({
+        ...snap,
+        cause_chat_dialogue: fullMessages.slice(-60),
+      })).catch(() => undefined)
       void appendSessionOperationLog(supabase, session.id, {
         at: new Date().toISOString(),
         stage: 2,
@@ -144,6 +238,9 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
         after: reply.slice(0, 2000),
       }).catch(() => undefined)
     } catch (err: unknown) {
+      // 回滚乐观更新：失败的消息不保留在界面上（也未持久化），内容放回输入框便于修改后重发
+      setChatMessages(chatMessages)
+      setChatInput(content)
       setChatError(err instanceof Error ? err.message : '归因对话失败')
     } finally {
       setChatLoading(false)
@@ -159,6 +256,7 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
   ]
 
   const confirmedCauses = causes.filter(c => c.confirmed)
+  const pendingCausesCount = causes.filter(c => !c.confirmed).length
 
 
   return (
@@ -168,32 +266,50 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
         <div>
           <div className="flex items-center justify-between mb-6">
             <div>
-              <h2 className="text-xl font-bold text-gray-900">阶段 2 — 归因分析</h2>
-              <p className="text-gray-500 text-sm mt-1">确认每个问题的深层原因（原因描述可直接编辑）</p>
+              <h2 className="text-xl font-bold text-gray-900">阶段2 · 步骤2 ｜ 归因分析</h2>
+              <p className="text-gray-400 text-xs mt-1">点击每个问题的「归因分析线索」由 AI 针对该问题及其证据生成，或自主添加归因（描述可直接编辑）</p>
             </div>
-            <button onClick={onAnalyze} disabled={analyzing}
-              className="text-sm text-blue-600 hover:underline disabled:opacity-50">
-              {analyzing ? '分析中…' : '🔄 重新分析'}
-            </button>
           </div>
 
-          {analysisError && <p className="text-red-500 text-sm mb-4">{analysisError}</p>}
-          {analyzing && <p className="text-blue-600 text-sm mb-4">正在自动生成归因，请稍候…</p>}
+          {stageError && <p className="text-red-500 text-sm mb-4">{stageError}</p>}
+          {actionError && (
+            <p className="text-sm mb-4 rounded-lg border border-red-200 bg-red-50 text-red-600 px-3 py-2">{actionError}</p>
+          )}
 
           {confirmedProblems.map(problem => {
             const problemCauses = causes.filter(c => c.problem_id === problem.id)
             const pendingCauses = problemCauses.filter(c => !c.confirmed)
             const confirmedProbCauses = problemCauses.filter(c => c.confirmed)
+            const evidence = (problem.evidence as Array<{ text: string; source?: string }> | null) ?? []
 
             return (
               <div key={problem.id} className="mb-6">
                 <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 mb-3">
-                  <p className="text-xs text-blue-400 font-medium mb-1">关联问题</p>
-                  <p className="text-sm font-medium text-blue-800">{problem.description}</p>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-xs text-blue-400 font-medium mb-1">关联问题</p>
+                      <p className="text-sm font-medium text-blue-800">{problem.description}</p>
+                    </div>
+                    <button
+                      onClick={() => analyzeCausesForProblem(problem)}
+                      disabled={analyzingId === problem.id}
+                      className="text-sm px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors shrink-0 whitespace-nowrap"
+                    >
+                      {analyzingId === problem.id ? '归因分析中…' : problemCauses.length > 0 ? '🔄 重新生成归因线索' : '🔍 归因分析线索'}
+                    </button>
+                  </div>
+                  {evidence.length > 0 && (
+                    <div className="mt-2 pt-2 border-t border-blue-100 space-y-1">
+                      <p className="text-[11px] text-blue-400 font-medium">📎 该问题关联证据</p>
+                      {evidence.map((e, i) => (
+                        <p key={i} className="text-[11px] text-blue-700/80 line-clamp-1">&ldquo;{e.text}&rdquo;</p>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
-                {problemCauses.length === 0 && (
-                  <p className="text-sm text-gray-400 text-center py-4">暂无 AI 分析的归因，可重新分析</p>
+                {problemCauses.length === 0 && analyzingId !== problem.id && (
+                  <p className="text-xs text-gray-400 text-center py-2">暂无归因线索，点击「归因分析线索」由 AI 生成，或在下方自主归因</p>
                 )}
 
                 <div className="space-y-3">
@@ -215,14 +331,22 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
                     />
                   ))}
                 </div>
+
+                <AddCauseForm
+                  saving={saving === `new-${problem.id}`}
+                  onAdd={desc => addManualCause(problem, desc)}
+                />
               </div>
             )
           })}
 
-          <div className="flex justify-end gap-3 mt-4">
+          <div className="flex justify-end items-center gap-3 mt-4">
+            {pendingCausesCount > 0 && (
+              <span className="text-xs text-amber-600">还有 {pendingCausesCount} 条待确认归因，确认或删除后方可进入下一环节</span>
+            )}
             <button
               onClick={onNext}
-              disabled={confirmedCauses.length === 0}
+              disabled={confirmedCauses.length === 0 || pendingCausesCount > 0}
               className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-colors"
             >
               进入改进措施 →
@@ -230,7 +354,7 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
           </div>
         </div>
 
-        <aside className="sticky top-6 rounded-xl border border-blue-200 bg-blue-50 p-4">
+        <aside className="sticky top-6 max-h-[calc(100vh-3rem)] flex flex-col rounded-xl border border-blue-200 bg-blue-50 p-4">
           <div className="flex items-center gap-3 mb-3">
             <div className="w-10 h-10 rounded-full bg-blue-600 text-white flex items-center justify-center text-sm font-bold">AI</div>
             <div>
@@ -266,7 +390,7 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
                 <select
                   value={focusProblemId}
                   onChange={e => setFocusProblemId(e.target.value)}
-                  className="w-full border border-blue-200 rounded-lg px-3 py-2 text-sm text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className="w-full border border-blue-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
                   {confirmedProblems.length === 0 && <option value="">（请先确认问题）</option>}
                   {confirmedProblems.map(p => (
@@ -275,7 +399,7 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
                 </select>
               </div>
 
-              <div className="bg-white border border-blue-100 rounded-lg p-3 h-64 overflow-y-auto space-y-2">
+              <div className="bg-white border border-blue-100 rounded-lg p-3 flex-1 min-h-[140px] overflow-y-auto space-y-2">
                 {chatMessages.map((m, idx) => (
                   <div
                     key={`${m.role}-${idx}`}
@@ -334,6 +458,36 @@ export default function Stage2Causes({ session, problems, causes, setCauses, onN
   )
 }
 
+function AddCauseForm({ saving, onAdd }: {
+  saving: boolean
+  onAdd: (desc: string) => void
+}) {
+  const [desc, setDesc] = useState('')
+  return (
+    <div className="mt-3 flex gap-2">
+      <input
+        value={desc}
+        onChange={e => setDesc(e.target.value)}
+        placeholder="+ 自主归因：填写你自己分析的原因…"
+        className="flex-1 border border-dashed border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        onKeyDown={e => {
+          if (e.key === 'Enter' && desc.trim()) {
+            onAdd(desc)
+            setDesc('')
+          }
+        }}
+      />
+      <button
+        onClick={() => { if (desc.trim()) { onAdd(desc); setDesc('') } }}
+        disabled={saving || !desc.trim()}
+        className="px-4 py-2 bg-gray-600 hover:bg-gray-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
+      >
+        {saving ? '添加中…' : '添加'}
+      </button>
+    </div>
+  )
+}
+
 function CauseCard({ cause, saving, onConfirm, onDelete, isConfirmed }: {
   cause: Cause
   saving: boolean
@@ -350,16 +504,16 @@ function CauseCard({ cause, saving, onConfirm, onDelete, isConfirmed }: {
       />
       <div className="flex justify-end gap-2 mt-3">
         <button onClick={onDelete}
-          className="text-xs px-3 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-red-50 hover:text-red-600 transition-colors">删除</button>
+          className="text-sm px-3 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-red-50 hover:text-red-600 transition-colors">删除</button>
         {!isConfirmed && (
           <button onClick={() => onConfirm(desc)} disabled={saving}
-            className="text-xs px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors">
+            className="text-sm px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors">
             {saving ? '保存…' : '确认'}
           </button>
         )}
         {isConfirmed && desc !== cause.description && (
           <button onClick={() => onConfirm(desc)} disabled={saving}
-            className="text-xs px-3 py-1.5 rounded-lg bg-gray-600 text-white hover:bg-gray-700 disabled:opacity-50 transition-colors">
+            className="text-sm px-3 py-1.5 rounded-lg bg-gray-600 text-white hover:bg-gray-700 disabled:opacity-50 transition-colors">
             {saving ? '保存…' : '保存修改'}
           </button>
         )}

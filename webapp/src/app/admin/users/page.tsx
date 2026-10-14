@@ -1,7 +1,6 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { formatDate } from '@/lib/utils'
 import type { Profile } from '@/types'
 import { Plus, Pencil, Trash2, X } from 'lucide-react'
 
@@ -38,6 +37,7 @@ interface UserFormData {
   password: string
   name: string
   role: 'teacher' | 'admin'
+  school: string
   subject: string
   grade: string
   textbook_version: string
@@ -48,6 +48,7 @@ const emptyForm: UserFormData = {
   password: '',
   name: '',
   role: 'teacher',
+  school: '',
   subject: '',
   grade: '',
   textbook_version: '',
@@ -62,6 +63,7 @@ export default function AdminUsersPage() {
   const [form, setForm] = useState<UserFormData>(emptyForm)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [keyword, setKeyword] = useState('')
 
   const loadUsers = useCallback(async () => {
     setLoading(true)
@@ -92,6 +94,7 @@ export default function AdminUsersPage() {
       password: '', // 密码留空表示不修改
       name: user.name || '',
       role: (user.role as 'teacher' | 'admin') || 'teacher',
+      school: user.school || '',
       subject: user.subject || '',
       grade: user.grade || '',
       textbook_version: user.textbook_version || '',
@@ -106,8 +109,16 @@ export default function AdminUsersPage() {
       setError('账户名必填')
       return
     }
-    if (!editing && !form.password) {
-      setError('密码必填')
+    if (!editing && !/^[a-zA-Z0-9._-]{3,32}$/.test(form.account.trim())) {
+      setError('账户名需为 3-32 位字母、数字或 . _ - 组合（不含中文、空格和 @）')
+      return
+    }
+    if (!editing && form.password.length < 6) {
+      setError('密码至少需要 6 位')
+      return
+    }
+    if (editing && form.password && form.password.length < 6) {
+      setError('新密码至少需要 6 位')
       return
     }
 
@@ -121,6 +132,7 @@ export default function AdminUsersPage() {
           body: JSON.stringify({
             name: form.name,
             role: form.role,
+            school: form.school,
             subject: form.subject,
             grade: form.grade,
             textbook_version: form.textbook_version,
@@ -141,6 +153,7 @@ export default function AdminUsersPage() {
             password: form.password,
             name: form.name,
             role: form.role,
+            school: form.school,
             subject: form.subject,
             grade: form.grade,
             textbook_version: form.textbook_version,
@@ -161,7 +174,8 @@ export default function AdminUsersPage() {
   }
 
   async function handleDelete(user: Profile) {
-    if (!confirm(`确定删除用户 "${user.name || '未命名'}" 吗？此操作不可恢复。`)) return
+    // 数据库级联：删除用户会连带删除该教师的全部反思记录
+    if (!confirm(`确定删除用户 "${user.name || '未命名'}" 吗？\n该用户的全部反思记录也将一并删除，此操作不可恢复。`)) return
     try {
       const res = await fetch(`/api/admin/users/${user.id}`, { method: 'DELETE' })
       if (!res.ok) {
@@ -185,16 +199,30 @@ export default function AdminUsersPage() {
 
   const textbookOptions = form.subject ? TEXTBOOK_VERSIONS[form.subject] || [] : []
 
+  // 前端过滤：按姓名/学校/学科搜索
+  const kw = keyword.trim().toLowerCase()
+  const filteredUsers = kw
+    ? users.filter(u => [u.name, u.school, u.subject].some(v => (v ?? '').toLowerCase().includes(kw)))
+    : users
+
   return (
     <div className="p-6 max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-gray-900">用户管理</h1>
-        <button
-          onClick={openCreate}
-          className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-        >
-          <Plus className="w-4 h-4" /> 新增用户
-        </button>
+        <div className="flex items-center gap-3">
+          <input
+            value={keyword}
+            onChange={e => setKeyword(e.target.value)}
+            placeholder="搜索姓名 / 学校 / 学科"
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <button
+            onClick={openCreate}
+            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+          >
+            <Plus className="w-4 h-4" /> 新增用户
+          </button>
+        </div>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
@@ -202,18 +230,19 @@ export default function AdminUsersPage() {
           <thead>
             <tr className="bg-gray-50 border-b border-gray-200">
               <th className="text-left px-4 py-3 font-medium text-gray-600">姓名</th>
+              <th className="text-left px-4 py-3 font-medium text-gray-600">学校</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">角色</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">学科</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">年级</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">教材版本</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-600">注册时间</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">操作</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {users.map(u => (
+            {filteredUsers.map(u => (
               <tr key={u.id} className="hover:bg-gray-50">
                 <td className="px-4 py-3 font-medium text-gray-900">{u.name ?? '—'}</td>
+                <td className="px-4 py-3 text-gray-600">{u.school ?? '—'}</td>
                 <td className="px-4 py-3">
                   <span className={`px-2 py-0.5 rounded-full text-xs ${u.role === 'admin' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
                     {u.role === 'admin' ? '管理员' : '教师'}
@@ -222,7 +251,6 @@ export default function AdminUsersPage() {
                 <td className="px-4 py-3 text-gray-600">{u.subject ?? '—'}</td>
                 <td className="px-4 py-3 text-gray-600">{u.grade ?? '—'}</td>
                 <td className="px-4 py-3 text-gray-600">{u.textbook_version ?? '—'}</td>
-                <td className="px-4 py-3 text-gray-400">{formatDate(u.created_at)}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
                     <button
@@ -245,8 +273,10 @@ export default function AdminUsersPage() {
             ))}
           </tbody>
         </table>
-        {!users.length && !loading && (
-          <div className="text-center py-12 text-gray-400">暂无用户数据</div>
+        {!filteredUsers.length && !loading && (
+          <div className="text-center py-12 text-gray-400">
+            {kw ? `未找到与 “${keyword.trim()}” 匹配的用户` : '暂无用户数据'}
+          </div>
         )}
         {loading && <div className="text-center py-12 text-gray-400">加载中…</div>}
       </div>
@@ -304,6 +334,17 @@ export default function AdminUsersPage() {
                   value={form.name}
                   onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
                   placeholder="请输入姓名"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+
+              {/* 所属学校 */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">所属学校</label>
+                <input
+                  value={form.school}
+                  onChange={e => setForm(f => ({ ...f, school: e.target.value }))}
+                  placeholder="请输入学校名称"
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>

@@ -12,7 +12,6 @@ export interface Database {
           subject: string | null
           grade: string | null
           textbook_version: string | null
-          textbook_detail: string | null
           avatar_url: string | null
           created_at: string
           updated_at: string
@@ -34,6 +33,9 @@ export interface Database {
           peer_review: string | null
           audio_url: string | null
           audio_transcript: string | null
+          student_performance: string | null
+          learning_outcomes: string | null
+          external_feedback: string | null
           current_stage: number
           status: 'draft' | 'analyzing' | 'done'
           draft_snapshot: Json | null
@@ -50,6 +52,7 @@ export interface Database {
           description: string
           evidence: Json | null
           source: string[] | null
+          specificity: 'none' | 'vague' | 'specific' | null
           confirmed: boolean
           sort_order: number
           created_at: string

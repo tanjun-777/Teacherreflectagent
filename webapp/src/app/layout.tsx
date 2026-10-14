@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AI 教学反思系统",
-  description: "AI 辅助教师教学反思与成长平台",
+  title: "人机协同教研系统",
+  description: "人工智能赋能教师教学反思",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

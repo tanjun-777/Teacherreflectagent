@@ -12,5 +12,7 @@ pnpm-debug.log*
 dev.log
 dev.err
 .dev-server.log
+dev-server.log
+*.log
 .DS_Store
 

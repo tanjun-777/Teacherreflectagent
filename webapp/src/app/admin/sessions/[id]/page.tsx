@@ -1,8 +1,48 @@
 import Link from 'next/link'
 import { notFound } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
-import { formatDate } from '@/lib/utils'
+import { formatDate, formatDateTime } from '@/lib/utils'
+import { getSessionOperationLogs } from '@/lib/session-audit'
+import { cleanLogText, clipLogText } from '@/lib/log-display'
 import type { ReflectionSession, Profile, Problem, Cause, Measure, ReflectionReport, ImprovementPlan } from '@/types'
+
+type AdminDeepeningResults = {
+  1?: { status: string; assumptions?: Array<{ original_clue: string; explicated: string }> }
+  2?: { status: string; examinations?: Array<{ assumption: string; method: string; conclusion: string }> }
+  3?: { status: string; new_understandings?: Array<{ based_on: string; statement: string }> }
+  4?: {
+    status: string
+    orientations?: Array<{ linked_understanding: string; principle: string; orientation: string }>
+    actions?: Array<{ context: string; time: string; method: string; expected_effect: string }>
+  }
+}
+
+type AdminDeepeningRecord = {
+  order?: number
+  row_index?: number
+  problem?: string
+  phase_results?: AdminDeepeningResults
+}
+
+// 各阶段成果文案（P4 宏观行动取向优先，兼容旧 actions 结构）
+function phaseContents(results?: AdminDeepeningResults) {
+  return {
+    p1: results?.[1]?.assumptions?.length
+      ? results[1].assumptions!.map((a, i) => `假设${i + 1}（原文线索：${a.original_clue}）\n外显表述：${a.explicated}`).join('\n\n')
+      : null,
+    p2: results?.[2]?.examinations?.length
+      ? results[2].examinations!.map((e, i) => `假设${i + 1}检视（${e.method}）\n检视结论：${e.conclusion}`).join('\n\n')
+      : null,
+    p3: results?.[3]?.new_understandings?.length
+      ? results[3].new_understandings!.map((n, i) => `新认识${i + 1}（基于${n.based_on}）\n表述：${n.statement}`).join('\n\n')
+      : null,
+    p4: results?.[4]?.orientations?.length
+      ? results[4].orientations!.map((o, i) => `宏观取向${i + 1}\n基于认识：${o.linked_understanding}\n基本原则：${o.principle}\n实践取向：${o.orientation}`).join('\n\n')
+      : results?.[4]?.actions?.length
+        ? results[4].actions!.map((a, i) => `行动${i + 1}\n情境：${a.context}\n时间：${a.time}\n方式：${a.method}\n预期效果：${a.expected_effect}`).join('\n\n')
+        : null,
+  }
+}
 
 export default async function AdminSessionDetailPage({ params }: { params: { id: string } }) {
   const supabase = createClient()
@@ -43,27 +83,14 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
       evidence?: string
       cause?: string
       measure?: string
-      priority?: string
     }>
-    deepening_results?: {
-      1?: { status: string; assumptions?: Array<{ original_clue: string; explicated: string }> }
-      2?: { status: string; examinations?: Array<{ assumption: string; method: string; conclusion: string }> }
-      3?: { status: string; new_understandings?: Array<{ based_on: string; statement: string }> }
-      4?: { status: string; actions?: Array<{ context: string; time: string; method: string; expected_effect: string }> }
-    }
+    deepening_results?: AdminDeepeningResults
+    deepening_records?: AdminDeepeningRecord[]
     submitted_at?: string
   } | null
 
-  const operationLogs = (Array.isArray(snapshot.operation_logs) ? snapshot.operation_logs : []) as Array<{
-    at?: string
-    stage?: number
-    action?: string
-    targetType?: string
-    targetId?: string
-    summary?: string
-    before?: string
-    after?: string
-  }>
+  // 合并读取：session_operation_logs 表 + 迁移前 draft_snapshot.operation_logs 历史数据
+  const operationLogs = await getSessionOperationLogs(supabase, session.id, session.draft_snapshot ?? null)
 
   const sortedLogs = [...operationLogs].sort((a, b) => {
     const ta = a.at ? new Date(a.at).getTime() : 0
@@ -71,12 +98,36 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
     return tb - ta
   })
 
+  // 操作类型分类（覆盖全部已记录的 action 命名）
   const classifyAction = (action?: string) => {
     if (!action) return '其他'
+    if (action.includes('提交')) return '提交'
+    if (action.includes('完成')) return '阶段完成'
+    if (action.includes('进入')) return '进入阶段'
+    if (action.includes('提问')) return '对话'
+    if (action.includes('回复')) return '对话'
+    if (action.includes('证据关联')) return '证据关联'
+    if (action.includes('新增') || action.includes('自主')) return '新增'
+    if (action.includes('参考') || action.includes('线索')) return 'AI参考'
     if (action.includes('确认')) return '确认'
     if (action.includes('删除')) return '删除'
     if (action.includes('修改')) return '修改'
     return '其他'
+  }
+
+  // 对象类型 → 中文标签
+  const TARGET_TYPE_LABEL: Record<string, string> = {
+    problem: '问题',
+    cause: '归因',
+    measure: '措施',
+    report: '反思报告',
+    deepening: '深化对话',
+    stage: '反思流程',
+  }
+  // 对象列仅显示中文标签，完整 ID 通过单元格 title 悬停查看（避免 UUID 字母噪音）
+  const formatTarget = (targetType?: string, targetId?: string) => {
+    if (!targetType && !targetId) return '—'
+    return TARGET_TYPE_LABEL[targetType ?? ''] ?? targetType ?? '记录'
   }
 
   const stageLogs: Record<1 | 2 | 3 | 4, typeof sortedLogs> = {
@@ -107,14 +158,12 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
           <p><span className="text-gray-400">学科/年级：</span><span className="text-gray-800">{[session.subject, session.grade].filter(Boolean).join(' · ') || '—'}</span></p>
           <p><span className="text-gray-400">上课日期：</span><span className="text-gray-800">{formatDate(session.class_date)}</span></p>
           <p><span className="text-gray-400">当前阶段：</span><span className="text-gray-800">{session.current_stage}/4</span></p>
-
-          <p><span className="text-gray-400">最后更新：</span><span className="text-gray-800">{formatDate(session.updated_at)}</span></p>
         </div>
       </section>
 
       <section className="grid grid-cols-4 gap-4">
         <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <p className="text-xs text-gray-500">问题识别</p>
+          <p className="text-xs text-gray-500">明确问题</p>
           <p className="text-2xl font-bold text-blue-600 mt-1">{confirmedProblems.length}/{problems.length}</p>
           <p className="text-xs text-gray-400 mt-1">已确认/总数</p>
         </div>
@@ -149,7 +198,6 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
                     <th className="text-left px-3 py-2">存在的问题（来源标注）</th>
                     <th className="text-left px-3 py-2">原因分析</th>
                     <th className="text-left px-3 py-2">改进措施与计划</th>
-                    <th className="text-left px-3 py-2">优先级</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -158,45 +206,44 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
                       <td className="px-3 py-2 whitespace-pre-wrap">{[row.problem, row.evidence].filter(Boolean).join('\n') || '—'}</td>
                       <td className="px-3 py-2 whitespace-pre-wrap">{row.cause || '—'}</td>
                       <td className="px-3 py-2 whitespace-pre-wrap">{row.measure || '—'}</td>
-                      <td className="px-3 py-2 whitespace-pre-wrap">{row.priority || '—'}</td>
                     </tr>
                   ))}
                   {!(finalPayload.rows ?? []).length && (
                     <tr>
-                      <td className="px-3 py-3 text-gray-400" colSpan={4}>暂无最终表格数据</td>
+                      <td className="px-3 py-3 text-gray-400" colSpan={3}>暂无最终表格数据</td>
                     </tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <DataBlock title="Phase 1 ｜ 既有假设外显" content={
-              finalPayload.deepening_results?.[1]?.assumptions?.length
-                ? finalPayload.deepening_results[1].assumptions!.map((a, i) =>
-                    `假设${i + 1}（原文线索：${a.original_clue}）\n外显表述：${a.explicated}`
-                  ).join('\n\n')
-                : null
-            } />
-            <DataBlock title="Phase 2 ｜ 批判性检视" content={
-              finalPayload.deepening_results?.[2]?.examinations?.length
-                ? finalPayload.deepening_results[2].examinations!.map((e, i) =>
-                    `假设${i + 1}检视（${e.method}）\n检视结论：${e.conclusion}`
-                  ).join('\n\n')
-                : null
-            } />
-            <DataBlock title="Phase 3 ｜ 新认识形成" content={
-              finalPayload.deepening_results?.[3]?.new_understandings?.length
-                ? finalPayload.deepening_results[3].new_understandings!.map((n, i) =>
-                    `新认识${i + 1}（基于${n.based_on}）\n表述：${n.statement}`
-                  ).join('\n\n')
-                : null
-            } />
-            <DataBlock title="Phase 4 ｜ 行动重构" content={
-              finalPayload.deepening_results?.[4]?.actions?.length
-                ? finalPayload.deepening_results[4].actions!.map((a, i) =>
-                    `行动${i + 1}\n情境：${a.context}\n时间：${a.time}\n方式：${a.method}\n预期效果：${a.expected_effect}`
-                  ).join('\n\n')
-                : null
-            } />
+            {(finalPayload.deepening_records ?? []).length > 0 ? (
+              (finalPayload.deepening_records!).map((rec, n) => {
+                const c = phaseContents(rec.phase_results)
+                return (
+                  <div key={`rec-${n}`} className="space-y-4">
+                    <div className="text-sm font-medium text-gray-800">
+                      深化记录 {n + 1}{typeof rec.row_index === 'number' ? `（对照表第 ${rec.row_index + 1} 条）` : ''}：{rec.problem ?? '—'}
+                    </div>
+                    <DataBlock title={`记录${n + 1} · Phase 1 ｜ 既有假设外显`} content={c.p1} />
+                    <DataBlock title={`记录${n + 1} · Phase 2 ｜ 批判性检视`} content={c.p2} />
+                    <DataBlock title={`记录${n + 1} · Phase 3 ｜ 新认识形成`} content={c.p3} />
+                    <DataBlock title={`记录${n + 1} · Phase 4 ｜ 宏观行动重构`} content={c.p4} />
+                  </div>
+                )
+              })
+            ) : (
+              (() => {
+                const c = phaseContents(finalPayload.deepening_results)
+                return (
+                  <>
+                    <DataBlock title="Phase 1 ｜ 既有假设外显" content={c.p1} />
+                    <DataBlock title="Phase 2 ｜ 批判性检视" content={c.p2} />
+                    <DataBlock title="Phase 3 ｜ 新认识形成" content={c.p3} />
+                    <DataBlock title="Phase 4 ｜ 宏观行动重构" content={c.p4} />
+                  </>
+                )
+              })()
+            )}
           </>
         ) : (
           <DataBlock title="最终报告正文" content={report?.content || report?.ai_draft || null} />
@@ -207,27 +254,31 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
         <h2 className="text-base font-semibold text-gray-900">过程操作记录（表格）</h2>
 
         <OperationLogsStageTable
-          title="阶段1：问题识别"
+          title="阶段2 · 步骤1 ｜ 明确问题"
           logs={stageLogs[1]}
           classifyAction={classifyAction}
+          formatTarget={formatTarget}
         />
 
         <OperationLogsStageTable
-          title="阶段2：归因分析"
+          title="阶段2 · 步骤2 ｜ 归因分析"
           logs={stageLogs[2]}
           classifyAction={classifyAction}
+          formatTarget={formatTarget}
         />
 
         <OperationLogsStageTable
-          title="阶段3：改进措施"
+          title="阶段2 · 步骤3 ｜ 改进措施"
           logs={stageLogs[3]}
           classifyAction={classifyAction}
+          formatTarget={formatTarget}
         />
 
         <OperationLogsStageTable
-          title="反思报告"
+          title="阶段3 ｜ 初步教学反思审视与深化"
           logs={stageLogs[4]}
           classifyAction={classifyAction}
+          formatTarget={formatTarget}
         />
       </section>
 
@@ -246,10 +297,14 @@ export default async function AdminSessionDetailPage({ params }: { params: { id:
   )
 }
 
+// 历史日志中 JSON 直写的深化结果 → 中文可读文本
+// 操作日志文本清洗、截断等展示逻辑统一维护在 @/lib/log-display
+
 function OperationLogsStageTable({
   title,
   logs,
   classifyAction,
+  formatTarget,
 }: {
   title: string
   logs: Array<{
@@ -263,6 +318,7 @@ function OperationLogsStageTable({
     after?: string
   }>
   classifyAction: (action?: string) => string
+  formatTarget: (targetType?: string, targetId?: string) => string
 }) {
   return (
     <div>
@@ -271,25 +327,32 @@ function OperationLogsStageTable({
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-gray-50 text-gray-700">
-              <th className="text-left px-3 py-2">时间</th>
-              <th className="text-left px-3 py-2">操作类型</th>
-              <th className="text-left px-3 py-2">对象</th>
+              <th className="text-left px-3 py-2 whitespace-nowrap">时间</th>
+              <th className="text-left px-3 py-2 whitespace-nowrap">操作类型</th>
+              <th className="text-left px-3 py-2 whitespace-nowrap">对象</th>
               <th className="text-left px-3 py-2">摘要</th>
               <th className="text-left px-3 py-2">变更前</th>
               <th className="text-left px-3 py-2">变更后</th>
             </tr>
           </thead>
           <tbody>
-            {logs.map((log, i) => (
+            {logs.map((log, i) => {
+              const summaryText = cleanLogText(log.summary)
+              const beforeText = cleanLogText(log.before)
+              const afterText = cleanLogText(log.after)
+              return (
               <tr key={`${log.at ?? 'na'}-${log.targetId ?? i}`} className="border-t border-gray-100 align-top">
-                <td className="px-3 py-2 whitespace-pre-wrap">{log.at ? formatDate(log.at) : '时间未知'}</td>
-                <td className="px-3 py-2 whitespace-pre-wrap">{classifyAction(log.action)}</td>
-                <td className="px-3 py-2 whitespace-pre-wrap">{[log.targetType, log.targetId].filter(Boolean).join(' · ') || '—'}</td>
-                <td className="px-3 py-2 whitespace-pre-wrap">{log.summary || '—'}</td>
-                <td className="px-3 py-2 whitespace-pre-wrap">{log.before || '—'}</td>
-                <td className="px-3 py-2 whitespace-pre-wrap">{log.after || '—'}</td>
+                <td className="px-3 py-2 whitespace-nowrap text-gray-500">{log.at ? formatDateTime(log.at) : '时间未知'}</td>
+                <td className="px-3 py-2 whitespace-nowrap">{classifyAction(log.action)}</td>
+                <td className="px-3 py-2 whitespace-nowrap" title={log.targetId ? `记录ID：${log.targetId}` : undefined}>
+                  {formatTarget(log.targetType, log.targetId)}
+                </td>
+                <td className="px-3 py-2 break-words" title={summaryText || undefined}>{summaryText ? clipLogText(summaryText) : '—'}</td>
+                <td className="px-3 py-2 break-words" title={beforeText || undefined}>{beforeText ? clipLogText(beforeText) : '—'}</td>
+                <td className="px-3 py-2 break-words" title={afterText || undefined}>{afterText ? clipLogText(afterText) : '—'}</td>
               </tr>
-            ))}
+              )
+            })}
             {!logs.length && (
               <tr>
                 <td className="px-3 py-3 text-gray-400" colSpan={6}>暂无操作记录</td>

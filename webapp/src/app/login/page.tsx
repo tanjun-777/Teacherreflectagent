@@ -48,8 +48,8 @@ export default function LoginPage() {
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
         <div className="text-center mb-8">
-          <h1 className="text-2xl font-bold text-gray-900">教师教学反思系统</h1>
-          <p className="text-gray-500 mt-1 text-sm">AI 辅助教学成长平台</p>
+          <h1 className="text-2xl font-bold text-gray-900">人机协同教研系统</h1>
+          <p className="text-gray-500 mt-1 text-sm">人工智能赋能教师教学反思</p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">

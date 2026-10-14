@@ -83,6 +83,7 @@ create table if not exists public.problems (
   description     text not null,
   evidence        jsonb,
   source          text[],
+  specificity     text check (specificity in ('none','vague','specific')),
   confirmed       boolean not null default false,
   sort_order      int not null default 0,
   created_at      timestamptz not null default now()
@@ -212,15 +213,18 @@ end $$;
 
 -- ------------------------------------------------------------
 -- 新用户自动建 profile
+-- 安全说明：role 一律写死 'teacher'，绝不信任客户端注册时传入的
+-- raw_user_meta_data.role（防止自助注册携带 role:"admin" 直接提权）。
+-- 管理员账号由管理端创建接口（service_role）显式设置 role。
 -- ------------------------------------------------------------
 create or replace function public.handle_new_user()
-returns trigger language plpgsql security definer as $$
+returns trigger language plpgsql security definer set search_path = public as $$
 begin
   insert into public.profiles(id, name, role)
   values (
     new.id,
     coalesce(new.raw_user_meta_data->>'name', new.email),
-    coalesce(new.raw_user_meta_data->>'role', 'teacher')
+    'teacher'
   )
   on conflict (id) do nothing;
   return new;
@@ -235,13 +239,16 @@ end $$;
 
 -- ------------------------------------------------------------
 -- 8. storage buckets + policies（防止 Bucket not found）
+--    桶为私有：录音/文档属敏感教学数据，下载一律经短期签名 URL
+--    （服务端 service_role 签名后供 ASR/解析使用；教师端播放用
+--     客户端签名，RLS 策略允许用户读取自己目录下的文件）
 -- ------------------------------------------------------------
 insert into storage.buckets (id, name, public)
-values ('audio-uploads', 'audio-uploads', true)
+values ('audio-uploads', 'audio-uploads', false)
 on conflict (id) do update set public = excluded.public;
 
 insert into storage.buckets (id, name, public)
-values ('doc-uploads', 'doc-uploads', true)
+values ('doc-uploads', 'doc-uploads', false)
 on conflict (id) do update set public = excluded.public;
 
 do $$ begin
@@ -271,6 +278,70 @@ do $$ begin
     where schemaname='storage' and tablename='objects' and policyname='用户可删除自己的上传文件'
   ) then
     execute 'create policy "用户可删除自己的上传文件" on storage.objects for delete to authenticated using ((bucket_id in (''audio-uploads'',''doc-uploads'')) and ((storage.foldername(name))[1] = auth.uid()::text))';
+  end if;
+end $$;
+
+-- ------------------------------------------------------------
+-- 9. 阶段1 数据收集扩展字段（学生表现 / 学习结果 / 外部智慧教研系统反馈）
+-- ------------------------------------------------------------
+alter table public.reflection_sessions add column if not exists student_performance text;
+alter table public.reflection_sessions add column if not exists learning_outcomes text;
+alter table public.reflection_sessions add column if not exists external_feedback text;
+alter table public.problems add column if not exists specificity text check (specificity in ('none','vague','specific'));
+
+-- ------------------------------------------------------------
+-- 10. 会话操作日志独立表（2026-10 审查修复：消除 draft_snapshot 并发覆盖）
+-- ------------------------------------------------------------
+create table if not exists public.session_operation_logs (
+  id            bigint generated always as identity primary key,
+  session_id    uuid not null references public.reflection_sessions(id) on delete cascade,
+  logged_at     timestamptz not null default now(),
+  stage         int not null check (stage between 1 and 4),
+  action        text not null,
+  target_type   text not null,
+  target_id     uuid,
+  summary       text,
+  before_value  text,
+  after_value   text
+);
+
+create index if not exists idx_session_operation_logs_session
+  on public.session_operation_logs (session_id, logged_at);
+
+alter table public.session_operation_logs enable row level security;
+
+do $$ begin
+  if not exists (select 1 from pg_policies where tablename='session_operation_logs' and policyname='教师可追加自己的会话日志') then
+    execute 'create policy "教师可追加自己的会话日志" on public.session_operation_logs for insert with check (exists (select 1 from public.reflection_sessions s where s.id = session_id and s.teacher_id = auth.uid()))';
+  end if;
+  if not exists (select 1 from pg_policies where tablename='session_operation_logs' and policyname='教师或管理员可读会话日志') then
+    execute 'create policy "教师或管理员可读会话日志" on public.session_operation_logs for select using (exists (select 1 from public.reflection_sessions s where s.id = session_id and (s.teacher_id = auth.uid() or public.get_my_role() = ''admin'')))';
+  end if;
+end $$;
+
+-- ------------------------------------------------------------
+-- 11. profiles 补 school 列（侧栏展示学校）
+-- ------------------------------------------------------------
+alter table public.profiles add column if not exists school text;
+
+-- ------------------------------------------------------------
+-- 12. 管理员只读旁路（2026-10 审查修复：管理端详情/导出读取子表为空）
+-- ------------------------------------------------------------
+do $$ begin
+  if not exists (select 1 from pg_policies where tablename='problems' and policyname='管理员可读所有问题') then
+    execute 'create policy "管理员可读所有问题" on public.problems for select using (public.get_my_role() = ''admin'')';
+  end if;
+  if not exists (select 1 from pg_policies where tablename='causes' and policyname='管理员可读所有归因') then
+    execute 'create policy "管理员可读所有归因" on public.causes for select using (public.get_my_role() = ''admin'')';
+  end if;
+  if not exists (select 1 from pg_policies where tablename='measures' and policyname='管理员可读所有措施') then
+    execute 'create policy "管理员可读所有措施" on public.measures for select using (public.get_my_role() = ''admin'')';
+  end if;
+  if not exists (select 1 from pg_policies where tablename='reflection_reports' and policyname='管理员可读所有报告') then
+    execute 'create policy "管理员可读所有报告" on public.reflection_reports for select using (public.get_my_role() = ''admin'')';
+  end if;
+  if not exists (select 1 from pg_policies where tablename='improvement_plans' and policyname='管理员可读所有改进计划') then
+    execute 'create policy "管理员可读所有改进计划" on public.improvement_plans for select using (public.get_my_role() = ''admin'')';
   end if;
 end $$;
 

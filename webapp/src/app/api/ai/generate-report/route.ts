@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { callLLM } from '@/lib/ai'
 import { getTeachingDesignForAnalysis } from '@/lib/teaching-design'
+import { buildEvidenceText, truncateText } from '@/lib/evidence'
 
 
 const SYSTEM_PROMPT = `【AI生成任务：教学反思总结与展望】
@@ -87,7 +88,7 @@ export async function POST(request: Request) {
     .maybeSingle()
 
   const [{ data: problems }, { data: causes }, { data: measures }] = await Promise.all([
-    supabase.from('problems').select('id, description').eq('session_id', session_id).eq('confirmed', true).order('sort_order'),
+    supabase.from('problems').select('id, description, evidence, source').eq('session_id', session_id).eq('confirmed', true).order('sort_order'),
     supabase.from('causes').select('id, problem_id, description').eq('session_id', session_id).eq('confirmed', true).order('sort_order'),
     supabase.from('measures').select('id, problem_id, cause_id, description').eq('session_id', session_id).eq('confirmed', true).order('sort_order'),
   ])
@@ -97,9 +98,15 @@ export async function POST(request: Request) {
     const tableRows = (measures ?? []).map((m, i) => {
       const problem = (problems ?? []).find(p => p.id === m.problem_id)
       const cause = (causes ?? []).find(c => c.id === m.cause_id)
-      const priority = i < 3 ? '高(P1)' : i < 6 ? '中(P2)' : '低(P3)'
-      return `${i + 1}. 问题：${problem?.description ?? '—'}｜归因：${cause?.description ?? '—'}｜改进措施：${m.description}｜优先级：${priority}`
+      const evidence = problem ? buildEvidenceText(problem) : '证据：暂无'
+      return `${i + 1}. 问题：${problem?.description ?? '—'}｜${evidence}｜归因：${cause?.description ?? '—'}｜改进措施：${m.description}`
     })
+
+    // 补齐课堂教学材料（长文本截断保护），与反思深化对话的材料范围保持一致
+    const audioTranscriptText = truncateText(session.audio_transcript, 4000)
+    const studentPerformanceText = truncateText(session.student_performance, 2000)
+    const learningOutcomesText = truncateText(session.learning_outcomes, 2000)
+    const externalFeedbackText = truncateText(session.external_feedback, 2000)
 
     const summary = [
       `课题：${session.lesson_topic ?? session.title}`,
@@ -110,11 +117,15 @@ export async function POST(request: Request) {
       ...(session.peer_review ? ['【同伴评价原文】', session.peer_review, ''] : []),
       '【原始教学设计材料】',
       ...(getTeachingDesignForAnalysis(session.teaching_design) ? [getTeachingDesignForAnalysis(session.teaching_design), ''] : ['（无）', '']),
+      ...(audioTranscriptText ? ['【课堂教学实录（转写）】', audioTranscriptText, ''] : []),
+      ...(studentPerformanceText ? ['【学生表现】', studentPerformanceText, ''] : []),
+      ...(learningOutcomesText ? ['【学习结果】', learningOutcomesText, ''] : []),
+      ...(externalFeedbackText ? ['【外部智慧教研系统反馈】', externalFeedbackText, ''] : []),
 
       '【课堂概述基础材料】',
       ...(problems?.map((p, i) => `${i + 1}. ${p.description}`) ?? ['（无）']),
       '',
-      '【问题—归因—改进措施对照表】',
+      '【问题—证据—归因—改进措施对照表】',
       ...(tableRows.length ? tableRows : ['（无）']),
     ].join('\n')
 

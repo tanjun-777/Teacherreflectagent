@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { isAllowedMediaUrl } from '@/lib/url-guard'
+import { signOwnedStorageUrl } from '@/lib/storage-sign'
 
 export async function POST(request: Request) {
   const supabase = createClient()
@@ -17,6 +19,11 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid target_field' }, { status: 400 })
   }
 
+  // 仅允许转写本站上传的录音（防 SSRF，与文档/图片解析路由一致）
+  if (!isAllowedMediaUrl(audio_url)) {
+    return NextResponse.json({ error: '仅支持转写本站上传的录音文件。' }, { status: 400 })
+  }
+
   // 验证会话归属
   const { data: session } = await supabase
     .from('reflection_sessions')
@@ -31,6 +38,9 @@ export async function POST(request: Request) {
     const appId = process.env.XUNFEI_APP_ID!
     const secretKey = process.env.XUNFEI_SECRET_KEY!
 
+    // 存储桶为私有：本站录音 URL 先换为 10 分钟签名 URL，供讯飞服务器拉取
+    const signedAudioUrl = await signOwnedStorageUrl(audio_url, 600)
+
     // 生成讯飞请求签名
     const ts = Math.floor(Date.now() / 1000).toString()
     const { createHash } = await import('crypto')
@@ -43,7 +53,7 @@ export async function POST(request: Request) {
       appId,
       signa,
       ts,
-      fileUrls: audio_url,
+      fileUrls: signedAudioUrl,
       language: 'cn',
       speakerNumber: '0',
     })
@@ -63,6 +73,7 @@ export async function POST(request: Request) {
 
     // 轮询等待结果（最多 10 分钟）
     let transcript = ''
+    let finishedButEmpty = false
     for (let i = 0; i < 60; i++) {
       await new Promise(r => setTimeout(r, 10000))
       const queryParams = new URLSearchParams({ appId, signa, ts, orderId })
@@ -85,12 +96,16 @@ export async function POST(request: Request) {
             } catch { return '' }
           })
           .join('\n')
+        if (!transcript) finishedButEmpty = true
         break
       }
     }
 
     if (!transcript) {
-      throw new Error('音频转写超时，请稍后在会话页面重试')
+      // 区分「转写完成但内容为空」与「转写超时」，避免误导性提示
+      throw new Error(finishedButEmpty
+        ? '音频转写完成但未识别到有效内容，请检查录音是否清晰后重试'
+        : '音频转写超时，请稍后在会话页面重试')
     }
 
     await supabase

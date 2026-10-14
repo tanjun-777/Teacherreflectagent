@@ -1,14 +1,21 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import type { ReflectionSession, Profile, Problem, Cause, Measure, ReflectionReport } from '@/types'
-
-type FinalPayloadRow = {
-  problem?: string
-  evidence?: string
-  cause?: string
-  measure?: string
-  priority?: string
-}
+import type { ReflectionSession, Profile, Problem, Cause, Measure } from '@/types'
+import { getSessionOperationLogs } from '@/lib/session-audit'
+import { cleanLogText } from '@/lib/log-display'
+import {
+  formatCell,
+  withEvidenceFallback,
+  buildRelationRows,
+  buildComparisonTableHtml,
+  buildDeepeningResultsHtml,
+  buildDeepeningRecordsHtml,
+  buildDialogueTableHtml,
+  type FinalPayloadRow,
+  type DeepeningResults,
+  type DeepeningRecordSummary,
+  type DialogueMessage,
+} from '@/lib/word-export'
 
 type OperationLog = {
   at?: string
@@ -19,20 +26,6 @@ type OperationLog = {
   summary?: string
   before?: string
   after?: string
-}
-
-function escapeHtml(value: unknown) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-
-function formatCell(value: unknown) {
-  const text = String(value ?? '').trim()
-  return text ? escapeHtml(text).replace(/\n/g, '<br/>') : '—'
 }
 
 export async function GET(
@@ -61,19 +54,17 @@ export async function GET(
 
   const session = rawSession as ReflectionSession
 
-  const [{ data: rawTeacher }, { data: rawProblems }, { data: rawCauses }, { data: rawMeasures }, { data: rawReport }] = await Promise.all([
+  const [{ data: rawTeacher }, { data: rawProblems }, { data: rawCauses }, { data: rawMeasures }] = await Promise.all([
     supabase.from('profiles').select('*').eq('id', session.teacher_id).maybeSingle(),
     supabase.from('problems').select('*').eq('session_id', session.id).order('sort_order'),
     supabase.from('causes').select('*').eq('session_id', session.id).order('sort_order'),
     supabase.from('measures').select('*').eq('session_id', session.id).order('sort_order'),
-    supabase.from('reflection_reports').select('*').eq('session_id', session.id).maybeSingle(),
   ])
 
   const teacher = rawTeacher as Profile | null
   const problems = (rawProblems ?? []) as Problem[]
   const causes = (rawCauses ?? []) as Cause[]
   const measures = (rawMeasures ?? []) as Measure[]
-  const report = (rawReport ?? null) as ReflectionReport | null
 
   const confirmedProblems = problems.filter(p => p.confirmed)
   const confirmedCauses = causes.filter(c => c.confirmed)
@@ -87,49 +78,29 @@ export async function GET(
   const finalPayload = (snapshot.final_report_payload ?? null) as {
     rows?: FinalPayloadRow[]
     overview?: string
-    outlook?: string
+    deepening_records?: DeepeningRecordSummary[]
+  } | null
+  const deepeningResults = (snapshot.deepening_results ?? null) as DeepeningResults | null
+  const deepeningDialogue = (Array.isArray(snapshot.deepening_dialogue) ? snapshot.deepening_dialogue : []) as DialogueMessage[]
+  // 多记录反思深化（新结构）：各记录独立累积的四阶段成果与对话
+  const deepeningRecords = (Array.isArray(finalPayload?.deepening_records) ? finalPayload.deepening_records : []) as DeepeningRecordSummary[]
+  const deepeningState = (snapshot.deepening ?? null) as {
+    active_row?: number | null
+    rows?: Record<string, { chat?: DialogueMessage[] }>
   } | null
 
-  const operationLogs = (Array.isArray(snapshot.operation_logs) ? snapshot.operation_logs : []) as OperationLog[]
-  const sortedLogs = [...operationLogs].sort((a, b) => {
-    const ta = a.at ? new Date(a.at).getTime() : 0
-    const tb = b.at ? new Date(b.at).getTime() : 0
-    return ta - tb
-  })
+  // 合并读取：session_operation_logs 表 + 迁移前 draft_snapshot.operation_logs 历史数据（升序）
+  const sortedLogs = await getSessionOperationLogs(supabase, session.id, session.draft_snapshot ?? null) as OperationLog[]
 
   const reportRows: FinalPayloadRow[] = (finalPayload?.rows && finalPayload.rows.length)
     ? finalPayload.rows
-    : Array.from({ length: Math.max(useProblems.length, useCauses.length, useMeasures.length) }).map((_, i) => ({
-      problem: useProblems[i]?.description,
-      cause: useCauses[i]?.description,
-      measure: useMeasures[i]?.description,
-      priority: i < 3 ? '高(P1)' : i < 6 ? '中(P2)' : '低(P3)',
-    }))
+    : buildRelationRows(useProblems, useCauses, useMeasures)
+
+  const tableRows = withEvidenceFallback(reportRows, useProblems)
 
   const overview = finalPayload?.overview || ''
-  const outlook = finalPayload?.outlook || ''
 
   const statusLabel: Record<string, string> = { draft: '草稿', analyzing: 'AI分析中', done: '已完成' }
-
-  const detailsRowsHtml = reportRows.length
-    ? reportRows.map((row, index) => `
-      <tr>
-        <td>${index + 1}</td>
-        <td>${formatCell([row.problem, row.evidence].filter(Boolean).join('\n'))}</td>
-        <td>${formatCell(row.cause)}</td>
-        <td>${formatCell(row.measure)}</td>
-        <td>${formatCell(row.priority)}</td>
-      </tr>
-    `).join('')
-    : `
-      <tr>
-        <td>1</td>
-        <td>—</td>
-        <td>—</td>
-        <td>—</td>
-        <td>—</td>
-      </tr>
-    `
 
   const classifyAction = (log: OperationLog) => {
     const action = log.action ?? ''
@@ -145,18 +116,18 @@ export async function GET(
     return '其他'
   }
 
-
   const buildStageLogsTable = (title: string, stage: 1 | 2 | 3 | 4) => {
     const stageLogs = sortedLogs.filter(log => log.stage === stage)
+    // 与管理端页面一致的日志清洗：JSON 转中文、剥离 Markdown 记号，保证导出 Word 清晰可读
     const rowsHtml = stageLogs.length
       ? stageLogs.map((log, index) => `
       <tr>
         <td>${index + 1}</td>
         <td>${formatCell(log.at)}</td>
         <td>${formatCell(classifyAction(log))}</td>
-        <td>${formatCell(log.summary)}</td>
-        <td>${formatCell(log.before)}</td>
-        <td>${formatCell(log.after)}</td>
+        <td>${formatCell(cleanLogText(log.summary))}</td>
+        <td>${formatCell(cleanLogText(log.before))}</td>
+        <td>${formatCell(cleanLogText(log.after))}</td>
       </tr>
     `).join('')
       : `
@@ -187,12 +158,11 @@ export async function GET(
   }
 
   const logsSectionHtml = [
-    buildStageLogsTable('阶段1：问题识别', 1),
-    buildStageLogsTable('阶段2：归因分析', 2),
-    buildStageLogsTable('阶段3：改进措施', 3),
-    buildStageLogsTable('反思报告', 4),
+    buildStageLogsTable('阶段2 · 步骤1 ｜ 明确问题', 1),
+    buildStageLogsTable('阶段2 · 步骤2 ｜ 归因分析', 2),
+    buildStageLogsTable('阶段2 · 步骤3 ｜ 改进措施', 3),
+    buildStageLogsTable('阶段3 ｜ 初步教学反思审视与深化', 4),
   ].join('')
-
 
   const html = `<!DOCTYPE html>
 <html>
@@ -220,7 +190,6 @@ export async function GET(
     <tr><td>学科</td><td>${formatCell(session.subject)}</td></tr>
     <tr><td>年级</td><td>${formatCell(session.grade)}</td></tr>
     <tr><td>上课日期</td><td>${formatCell(session.class_date)}</td></tr>
-    <tr><td>阶段</td><td>${formatCell(`${session.current_stage}/4`)}</td></tr>
     <tr><td>状态</td><td>${formatCell(statusLabel[session.status] ?? session.status)}</td></tr>
     <tr><td>创建时间</td><td>${formatCell(session.created_at)}</td></tr>
     <tr><td>更新时间</td><td>${formatCell(session.updated_at)}</td></tr>
@@ -230,24 +199,27 @@ export async function GET(
   <p><strong>一、课堂概述</strong></p>
   <p>${formatCell(overview)}</p>
 
-  <p><strong>二、问题/归因/措施对照表</strong></p>
-  <table>
-    <tr>
-      <th style="width: 56px;">序号</th>
-      <th style="width: 32%;">问题（含证据）</th>
-      <th style="width: 22%;">归因</th>
-      <th style="width: 28%;">措施</th>
-      <th style="width: 12%;">优先级</th>
-    </tr>
-    ${detailsRowsHtml}
-  </table>
+  <p><strong>二、问题/证据/归因/措施对照表</strong></p>
+  ${buildComparisonTableHtml(tableRows)}
 
-  <p><strong>三、总结与展望</strong></p>
-  <p>${formatCell(outlook || report?.content || report?.ai_draft)}</p>
+  <p><strong>三、教学反思审视与深化结果</strong></p>
+  ${deepeningRecords.length ? buildDeepeningRecordsHtml(deepeningRecords) : buildDeepeningResultsHtml(deepeningResults)}
 
-  <h2>第三部分：操作过程记录</h2>
+  <h2>第三部分：系统操作记录</h2>
   ${logsSectionHtml}
 
+  <h2>第四部分：反思深化对话记录</h2>
+  ${
+    deepeningState?.rows && Object.keys(deepeningState.rows).length
+      ? Object.keys(deepeningState.rows).map(Number).sort((a, b) => a - b).map(idx => {
+          const row = deepeningState.rows![String(idx)] ?? {}
+          const chat: DialogueMessage[] = Array.isArray(row.chat) ? row.chat : []
+          const problemText = String(tableRows[idx]?.problem ?? '').trim()
+          const title = `深化对象 第 ${idx + 1} 条${problemText ? `：${problemText.length > 60 ? `${problemText.slice(0, 60)}…` : problemText}` : ''}`
+          return `\n  <p><strong>${formatCell(title)}</strong></p>\n  ${buildDialogueTableHtml(chat)}`
+        }).join('\n')
+      : buildDialogueTableHtml(deepeningDialogue)
+  }
 </body>
 </html>`
 

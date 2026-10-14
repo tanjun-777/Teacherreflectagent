@@ -1,17 +1,23 @@
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/server'
-import { formatDate } from '@/lib/utils'
 import type { ReflectionSession, Profile } from '@/types'
 import DeleteSessionButton from './DeleteSessionButton'
 
 
 export default async function AdminSessionsPage() {
   const supabase = createClient()
-  const { data: rawSessions } = await supabase
-    .from('reflection_sessions')
-    .select('*')
-    .order('updated_at', { ascending: false })
-    .limit(100)
+  // 列表最多展示 500 条（按更新时间倒序），并用 count 提示总数
+  const PAGE_LIMIT = 500
+  const [{ data: rawSessions }, { count: totalCount }] = await Promise.all([
+    supabase
+      .from('reflection_sessions')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(PAGE_LIMIT),
+    supabase
+      .from('reflection_sessions')
+      .select('*', { count: 'exact', head: true }),
+  ])
 
   const sessions = (rawSessions ?? []) as ReflectionSession[]
 
@@ -33,8 +39,23 @@ export default async function AdminSessionsPage() {
     <div className="p-6 max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-gray-900">反思记录</h1>
-        <p className="text-sm text-gray-500">支持按条导出 Word（含列表字段、反思详情与过程记录）</p>
+        <div className="flex items-center gap-4">
+          <a
+            href="/api/admin/export-sessions"
+            className="text-sm text-blue-600 hover:underline"
+          >
+            导出全部CSV
+          </a>
+          <p className="text-sm text-gray-500">
+            共 {totalCount ?? sessions.length} 条
+          </p>
+        </div>
       </div>
+      {(totalCount ?? 0) > sessions.length && (
+        <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+          仅显示最近更新的 {sessions.length} 条，其余 {totalCount! - sessions.length} 条请使用导出功能查看全部数据。
+        </p>
+      )}
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <table className="w-full text-sm">
           <thead>
@@ -44,7 +65,6 @@ export default async function AdminSessionsPage() {
               <th className="text-left px-4 py-3 font-medium text-gray-600">学科/年级</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">阶段</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">状态</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-600">更新时间</th>
               <th className="text-left px-4 py-3 font-medium text-gray-600">操作</th>
             </tr>
           </thead>
@@ -66,7 +86,6 @@ export default async function AdminSessionsPage() {
                       {statusLabel[s.status]}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-gray-400">{formatDate(s.updated_at)}</td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-3">
                       <Link
