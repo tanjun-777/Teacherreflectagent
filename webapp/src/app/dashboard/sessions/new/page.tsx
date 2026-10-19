@@ -335,7 +335,17 @@ function ClassAudioInput({ file, onFile, blob, onBlob }: ClassAudioInputProps) {
   )
 }
 
-// ─── 文本 + 文档/图片（多选，图片自动识别文字）组件 ─────────────
+// ─── 文本 + 文档/图片（图片选择后立即识别，教师确认后并入提交文本）组件 ─────────────
+// 图片条目：选择后立即上传并识别，教师确认（status=confirmed）后才会拼入提交文本
+type ImageItem = {
+  id: string
+  file: File
+  previewUrl: string
+  status: 'recognizing' | 'pending' | 'confirmed' | 'failed'
+  text: string
+  error: string
+}
+
 interface DocImageFieldProps {
   label: string
   value: string
@@ -343,34 +353,84 @@ interface DocImageFieldProps {
   placeholder: string
   files: File[]
   onFiles: (fs: File[]) => void
+  images: ImageItem[]
+  onImages: React.Dispatch<React.SetStateAction<ImageItem[]>>
+  recognizeImage: (file: File) => Promise<string>
 }
 
-function DocImageField({ label, value, onChange, placeholder, files, onFiles }: DocImageFieldProps) {
+function DocImageField({ label, value, onChange, placeholder, files, onFiles, images, onImages, recognizeImage }: DocImageFieldProps) {
   const inputRef = useRef<HTMLInputElement>(null)
+
+  // 组件卸载时释放本地预览 URL
+  useEffect(() => () => { images.forEach(im => URL.revokeObjectURL(im.previewUrl)) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  function removeImage(id: string) {
+    onImages(prev => {
+      const target = prev.find(im => im.id === id)
+      if (target) URL.revokeObjectURL(target.previewUrl)
+      return prev.filter(im => im.id !== id)
+    })
+  }
+
+  // 上传并识别单张图片：完成后进入待确认状态；期间被移除则丢弃结果
+  async function startRecognize(item: ImageItem) {
+    try {
+      const text = await recognizeImage(item.file)
+      onImages(prev => prev.some(im => im.id === item.id)
+        ? prev.map(im => im.id === item.id ? { ...im, status: 'pending' as const, text, error: '' } : im)
+        : prev)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '图片识别失败'
+      onImages(prev => prev.some(im => im.id === item.id)
+        ? prev.map(im => im.id === item.id ? { ...im, status: 'failed' as const, error: message } : im)
+        : prev)
+    }
+  }
 
   function handleSelect(list: FileList | null) {
     if (!list || list.length === 0) return
-    const next = [...files]
+    const nextDocs = [...files]
+    const newImages: ImageItem[] = []
     for (const f of Array.from(list)) {
-      if (next.length >= MAX_FIELD_FILES) { alert(`「${label}」最多上传 ${MAX_FIELD_FILES} 个文件`); break }
+      if (nextDocs.length + images.length + newImages.length >= MAX_FIELD_FILES) {
+        alert(`「${label}」最多上传 ${MAX_FIELD_FILES} 个文件`); break
+      }
       if (isDocFile(f.name)) {
-        next.push(f)
+        nextDocs.push(f)
       } else if (isImageFile(f)) {
         if (f.size > MAX_IMAGE_SIZE) { alert(`图片 ${f.name} 超过 10MB，请压缩后上传`); continue }
-        next.push(f)
+        newImages.push({
+          id: crypto.randomUUID(),
+          file: f,
+          previewUrl: URL.createObjectURL(f),
+          status: 'recognizing',
+          text: '',
+          error: '',
+        })
       } else {
         alert(`不支持的文件类型：${f.name}（仅支持 .docx / .pdf / .txt 或图片）`)
       }
     }
-    onFiles(next)
+    if (nextDocs.length !== files.length) onFiles(nextDocs)
+    if (newImages.length > 0) {
+      onImages(prev => [...prev, ...newImages])
+      newImages.forEach(startRecognize) // 并行识别，互不阻塞
+    }
     if (inputRef.current) inputRef.current.value = ''
+  }
+
+  const statusBadge: Record<ImageItem['status'], { text: string; cls: string }> = {
+    recognizing: { text: '识别中', cls: 'bg-blue-100 text-blue-600' },
+    pending: { text: '待确认', cls: 'bg-amber-100 text-amber-700' },
+    confirmed: { text: '已确认', cls: 'bg-green-100 text-green-700' },
+    failed: { text: '识别失败', cls: 'bg-red-100 text-red-600' },
   }
 
   return (
     <div>
       <label className="block text-sm font-medium text-gray-700 mb-1">
         {label}
-        <span className="text-gray-400 font-normal ml-2">（文本，或上传文档/图片，图片自动识别文字）</span>
+        <span className="text-gray-400 font-normal ml-2">（文本，或上传文档/图片；图片识别结果需确认后使用）</span>
       </label>
       <textarea
         value={value} onChange={e => onChange(e.target.value)}
@@ -389,13 +449,80 @@ function DocImageField({ label, value, onChange, placeholder, files, onFiles }: 
         <button type="button" onClick={() => inputRef.current?.click()} className="text-sm text-blue-600 hover:underline">
           + 上传文档或图片（.docx/.pdf/.txt 或图片，支持多选）
         </button>
+
+        {/* 图片识别结果：逐张确认后才会并入「保存并进入分析」的文本 */}
+        {images.length > 0 && (
+          <div className="space-y-2">
+            {images.map(im => {
+              const badge = statusBadge[im.status]
+              return (
+                <div key={im.id} className={`flex gap-2.5 border rounded-lg p-2.5 ${
+                  im.status === 'confirmed' ? 'border-green-200 bg-green-50/50'
+                  : im.status === 'failed' ? 'border-red-200 bg-red-50/50'
+                  : 'border-gray-200 bg-gray-50/60'
+                }`}>
+                  <a href={im.previewUrl} target="_blank" rel="noreferrer" title="点击在新标签页查看原图" className="shrink-0">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={im.previewUrl} alt={im.file.name}
+                      className="w-20 h-20 object-cover rounded border border-gray-200 hover:opacity-80" />
+                  </a>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-gray-700 truncate flex-1" title={im.file.name}>
+                        {im.file.name}（{(im.file.size / 1024).toFixed(0)} KB）
+                      </span>
+                      <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${badge.cls}`}>{badge.text}</span>
+                      <button type="button" onClick={() => removeImage(im.id)}
+                        className="text-xs text-gray-400 hover:text-red-500 shrink-0">
+                        移除
+                      </button>
+                    </div>
+
+                    {im.status === 'recognizing' && (
+                      <p className="text-xs text-blue-500 mt-1.5">正在识别图片文字，请稍候…</p>
+                    )}
+
+                    {im.status === 'failed' && (
+                      <p className="text-xs text-red-500 mt-1.5">
+                        {im.error} 请移除后重新组织资料上传（可改传更清晰的图片、文档，或直接在文本框粘贴内容）。
+                      </p>
+                    )}
+
+                    {im.status === 'pending' && (
+                      <div className="mt-1.5">
+                        <p className="text-xs text-amber-600">
+                          请对照原图核对识别结果（〔?〕表示无法确认的字符）：无误请点击「确认使用」；不满意请移除后重新上传。
+                        </p>
+                        <pre className="mt-1.5 max-h-40 overflow-y-auto text-xs text-gray-600 whitespace-pre-wrap bg-white border border-gray-200 rounded p-2">{im.text}</pre>
+                        <div className="mt-1.5 flex gap-3">
+                          <button type="button"
+                            onClick={() => onImages(prev => prev.map(x => x.id === im.id ? { ...x, status: 'confirmed' as const } : x))}
+                            className="text-xs px-2.5 py-1 rounded bg-green-600 hover:bg-green-700 text-white">
+                            ✓ 确认使用
+                          </button>
+                          <button type="button" onClick={() => removeImage(im.id)}
+                            className="text-xs px-2.5 py-1 rounded border border-gray-300 hover:border-red-300 hover:text-red-600 text-gray-500">
+                            ✗ 移除并重新上传
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {im.status === 'confirmed' && (
+                      <p className="text-xs text-green-600 mt-1.5">✓ 已确认，保存时将自动并入「{label}」</p>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
         {files.length > 0 && (
           <ul className="space-y-1">
             {files.map((f, i) => (
               <li key={`${f.name}-${i}`} className="flex items-center gap-2 text-sm text-gray-600">
-                <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${isImageFile(f) ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
-                  {isImageFile(f) ? '图片' : '文档'}
-                </span>
+                <span className="text-xs px-1.5 py-0.5 rounded shrink-0 bg-blue-100 text-blue-700">文档</span>
                 <span className="truncate flex-1">{f.name}（{(f.size / 1024).toFixed(0)} KB）</span>
                 <button type="button" onClick={() => onFiles(files.filter((_, idx) => idx !== i))}
                   className="text-gray-400 hover:text-red-500 shrink-0">
@@ -490,6 +617,9 @@ export default function NewSessionPage() {
   // 学生表现 / 学习结果：文档 + 图片（多选）
   const [studentPerfFiles, setStudentPerfFiles] = useState<File[]>([])
   const [learningOutcomeFiles, setLearningOutcomeFiles] = useState<File[]>([])
+  // 图片单独管理：选择后立即识别，教师确认后才会并入提交文本
+  const [studentPerfImages, setStudentPerfImages] = useState<ImageItem[]>([])
+  const [learningOutcomeImages, setLearningOutcomeImages] = useState<ImageItem[]>([])
 
   // 录音 blob（教师自评 / 多主体同伴反馈）
   const [selfReviewBlob, setSelfReviewBlob] = useState<Blob | null>(null)
@@ -686,6 +816,19 @@ export default function NewSessionPage() {
     return { text: extracted, url: urlData.publicUrl }
   }
 
+  // 学生表现 / 学习结果图片：选择后立即识别（上传＋OCR），供 DocImageField 调用
+  async function recognizeStudentPerfImage(file: File) {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) throw new Error('登录状态已失效，请刷新页面后重试')
+    return (await uploadImageAndExtractText(file, user.id, 'student_perf_img', '学生表现')).text
+  }
+
+  async function recognizeLearningOutcomeImage(file: File) {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) throw new Error('登录状态已失效，请刷新页面后重试')
+    return (await uploadImageAndExtractText(file, user.id, 'learning_outcome_img', '学习结果')).text
+  }
+
   // 批量处理文档/图片文件：解析并合并为带来源标注的文本段
   async function processCollectedFiles(files: File[], userId: string, prefix: string, label: string) {
     const segments: string[] = []
@@ -708,6 +851,18 @@ export default function NewSessionPage() {
 
     e.preventDefault()
     if (!form.title.trim()) { setError('请填写反思标题'); return }
+    // 存在未确认（识别中/待确认/识别失败）的图片时阻止保存
+    const unfinishedImages = [
+      { label: '学生表现', items: studentPerfImages },
+      { label: '学习结果', items: learningOutcomeImages },
+    ].flatMap(({ label: l, items }) => items.map(im => ({ label: l, im })))
+      .filter(({ im }) => im.status !== 'confirmed')
+    if (unfinishedImages.length > 0) {
+      const { label: fieldLabel, im } = unfinishedImages[0]
+      const stateText = im.status === 'recognizing' ? '正在识别' : im.status === 'failed' ? '识别失败' : '待确认'
+      setError(`「${fieldLabel}」图片 ${im.file.name} ${stateText}，请先确认或移除全部图片识别结果后再保存`)
+      return
+    }
     setError('')
     setLoading(true)
     try {
@@ -783,12 +938,23 @@ export default function NewSessionPage() {
       let learning_outcomes = form.learning_outcomes
       let external_feedback = form.external_feedback
 
-      if (studentPerfFiles.length > 0) {
-        const segments = await processCollectedFiles(studentPerfFiles, user.id, 'student_perf', '学生表现')
+      // 图片：直接使用已确认的识别文本（上传与识别在选择时已完成）；文档：提交时解析
+      if (studentPerfFiles.length > 0 || studentPerfImages.length > 0) {
+        const segments: string[] = studentPerfImages
+          .filter(im => im.status === 'confirmed')
+          .map(im => `【图片识别：${im.file.name}】\n${im.text}`)
+        if (studentPerfFiles.length > 0) {
+          segments.push(...await processCollectedFiles(studentPerfFiles, user.id, 'student_perf', '学生表现'))
+        }
         student_performance = [student_performance.trim(), ...segments].filter(Boolean).join('\n\n')
       }
-      if (learningOutcomeFiles.length > 0) {
-        const segments = await processCollectedFiles(learningOutcomeFiles, user.id, 'learning_outcome', '学习结果')
+      if (learningOutcomeFiles.length > 0 || learningOutcomeImages.length > 0) {
+        const segments: string[] = learningOutcomeImages
+          .filter(im => im.status === 'confirmed')
+          .map(im => `【图片识别：${im.file.name}】\n${im.text}`)
+        if (learningOutcomeFiles.length > 0) {
+          segments.push(...await processCollectedFiles(learningOutcomeFiles, user.id, 'learning_outcome', '学习结果'))
+        }
         learning_outcomes = [learning_outcomes.trim(), ...segments].filter(Boolean).join('\n\n')
       }
       if (externalDocFile) {
@@ -968,6 +1134,9 @@ export default function NewSessionPage() {
             placeholder="记录学生课堂参与、互动、专注度等表现，或上传学生作业/作品照片（自动识别文字）…"
             files={studentPerfFiles}
             onFiles={setStudentPerfFiles}
+            images={studentPerfImages}
+            onImages={setStudentPerfImages}
+            recognizeImage={recognizeStudentPerfImage}
           />
 
           {/* 学习结果：文本 + 文档/图片（图片自动识别文字） */}
@@ -978,6 +1147,9 @@ export default function NewSessionPage() {
             placeholder="记录作业完成、测验成绩、目标达成等学习结果，或上传图片（自动识别文字）…"
             files={learningOutcomeFiles}
             onFiles={setLearningOutcomeFiles}
+            images={learningOutcomeImages}
+            onImages={setLearningOutcomeImages}
+            recognizeImage={recognizeLearningOutcomeImage}
           />
         </div>
 

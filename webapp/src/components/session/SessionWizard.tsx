@@ -71,11 +71,13 @@ export default function SessionWizard({
 
   const autoTriggeredRef = useRef<Record<number, boolean>>({})
 
-  // 阶段2/3 助手对话历史（持久化于 draft_snapshot，刷新后恢复）
+  // 阶段1/2/3 助手对话历史（持久化于 draft_snapshot，刷新后恢复）
   const initialChatSnapshot = (session.draft_snapshot ?? {}) as {
+    problem_chat_dialogue?: Array<{ role: 'user' | 'assistant'; content: string }>
     cause_chat_dialogue?: Array<{ role: 'user' | 'assistant'; content: string }>
     measure_chat_dialogue?: Array<{ role: 'user' | 'assistant'; content: string }>
   }
+  const initialProblemChat = initialChatSnapshot.problem_chat_dialogue ?? []
   const initialCauseChat = initialChatSnapshot.cause_chat_dialogue ?? []
   const initialMeasureChat = initialChatSnapshot.measure_chat_dialogue ?? []
 
@@ -368,7 +370,12 @@ export default function SessionWizard({
 
   return (
     <div className="flex flex-col h-full">
-      <div className="bg-white border-b border-gray-200 px-6 py-4">
+      <div className="relative bg-white border-b border-gray-200 px-6 py-4">
+        {/* 右上角提示：蓝色阶段/步骤标识可点击回溯（窄屏隐藏，避免与居中导航重叠） */}
+        <div className="absolute right-6 top-4 hidden md:flex items-center gap-1.5 text-xs text-gray-400">
+          <span className="w-2 h-2 rounded-full bg-blue-500 inline-block" />
+          <span>蓝色阶段可点击回溯，灰色为未解锁</span>
+        </div>
         {/* 大阶段指示器：阶段1(已完成) → 阶段2(反思进程) → 阶段3(审视与深化) */}
         <div className="flex items-center gap-1 max-w-4xl mx-auto">
           {PHASES.map((p, i) => {
@@ -464,6 +471,7 @@ export default function SessionWizard({
             analyzing={stage1Analyzing}
             analysisError={stage1Error}
             onProblemDeleted={handleProblemDeleted}
+            initialChatMessages={initialProblemChat}
           />
         )}
         {currentStage === 2 && (

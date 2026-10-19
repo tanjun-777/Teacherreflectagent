@@ -4,8 +4,12 @@ import { createClient } from '@/lib/supabase/client'
 import type { ReflectionSession, Problem, SourceTag, EvidenceSourceTag } from '@/types'
 import { SOURCE_LABEL, SOURCE_COLOR, EVIDENCE_SOURCE_LABEL } from '@/types'
 import { cn } from '@/lib/utils'
-import { appendSessionOperationLog } from '@/lib/session-audit'
+import { appendSessionOperationLog, updateDraftSnapshotFields } from '@/lib/session-audit'
 
+type ChatMessage = {
+  role: 'user' | 'assistant'
+  content: string
+}
 
 interface Props {
   session: ReflectionSession
@@ -17,6 +21,8 @@ interface Props {
   analysisError: string
   // 删除问题后数据库会级联删除其归因/措施，需同步清理向导本地状态
   onProblemDeleted?: (problemId: string) => void
+  // 刷新后恢复的历史对话（draft_snapshot.problem_chat_dialogue）
+  initialChatMessages?: ChatMessage[]
 }
 
 const MANUAL_SOURCE_OPTIONS: Array<{ value: SourceTag; label: string }> = [
@@ -28,7 +34,7 @@ const MANUAL_SOURCE_OPTIONS: Array<{ value: SourceTag; label: string }> = [
 
 const EVIDENCE_SOURCE_OPTIONS: EvidenceSourceTag[] = ['teaching_design', 'student_performance', 'learning_outcomes', 'classroom_record', 'external_feedback']
 
-export default function Stage1Problems({ session, problems, setProblems, onNext, onAnalyze, analyzing, analysisError, onProblemDeleted }: Props) {
+export default function Stage1Problems({ session, problems, setProblems, onNext, onAnalyze, analyzing, analysisError, onProblemDeleted, initialChatMessages }: Props) {
   const supabase = createClient()
   const [newDesc, setNewDesc] = useState('')
   const [newSource, setNewSource] = useState<SourceTag>('teacher_manual')
@@ -37,6 +43,85 @@ export default function Stage1Problems({ session, problems, setProblems, onNext,
   const [linkError, setLinkError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [extractTried, setExtractTried] = useState(false)
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const [chatError, setChatError] = useState('')
+  const [chatOpen, setChatOpen] = useState(false)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(
+    initialChatMessages?.length
+      ? initialChatMessages
+      : [
+        {
+          role: 'assistant',
+          content: '我是问题聚焦助手，我将帮助你完成两件事：先基于课堂证据判断观察到的现象是否构成教学问题，再把问题聚焦得具体、可反思。先从这一步开始：你观察到的课堂现象是什么？',
+        },
+      ]
+  )
+
+  // 问题聚焦助手对话：基于证据的问题判断＋问题聚焦引导（追问式，不代答）
+  async function sendChatMessage(raw: string) {
+    const content = raw.trim()
+    if (!content || chatLoading) return
+
+    const nextMessages: ChatMessage[] = [...chatMessages, { role: 'user', content }]
+    setChatMessages(nextMessages)
+    setChatInput('')
+    setChatError('')
+    setChatLoading(true)
+    void appendSessionOperationLog(supabase, session.id, {
+      at: new Date().toISOString(),
+      stage: 1,
+      action: '机器人对话-教师提问',
+      targetType: 'problem',
+      summary: '教师向问题聚焦助手发送消息',
+      after: content.slice(0, 2000),
+    }).catch(() => undefined)
+
+    try {
+      const res = await fetch('/api/ai/problem-coach-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: session.id,
+          messages: nextMessages,
+        }),
+      })
+
+      const payload = await res.json().catch(() => null) as { error?: string; reply?: string } | null
+      if (!res.ok) throw new Error(payload?.error ?? '问题对话失败')
+
+      const reply = String(payload?.reply ?? '').trim() || '我已收到。请继续提供更具体的课堂现象与证据。'
+      const fullMessages: ChatMessage[] = [...nextMessages, { role: 'assistant', content: reply }]
+      setChatMessages(fullMessages)
+      // 持久化对话到 draft_snapshot（串行队列防并发覆盖），刷新后可恢复
+      void updateDraftSnapshotFields(supabase, session.id, snap => ({
+        ...snap,
+        problem_chat_dialogue: fullMessages.slice(-60),
+      })).catch(() => undefined)
+      void appendSessionOperationLog(supabase, session.id, {
+        at: new Date().toISOString(),
+        stage: 1,
+        action: '机器人对话-助手回复',
+        targetType: 'problem',
+        summary: '问题聚焦助手回复消息',
+        after: reply.slice(0, 2000),
+      }).catch(() => undefined)
+    } catch (err: unknown) {
+      // 回滚乐观更新：失败的消息不保留在界面上（也未持久化），内容放回输入框便于修改后重发
+      setChatMessages(chatMessages)
+      setChatInput(content)
+      setChatError(err instanceof Error ? err.message : '问题对话失败')
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  const askTemplates = [
+    '你观察到的课堂现象是什么？',
+    '有什么课堂证据支持？',
+    '这个现象反映了哪个教学问题？',
+    '这个问题的表述是否具体、可归因？',
+  ]
 
   const confirmed = problems.filter(p => p.confirmed)
   const pending = problems.filter(p => !p.confirmed)
@@ -189,8 +274,10 @@ export default function Stage1Problems({ session, problems, setProblems, onNext,
 
 
   return (
-    <div className="p-6 max-w-3xl mx-auto">
-      <div className="flex items-center justify-between mb-6">
+    <div className="p-6 max-w-[1440px] mx-auto">
+      <div className="grid grid-cols-[minmax(0,1fr)_460px] gap-6 items-start">
+        <div>
+          <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-xl font-bold text-gray-900">阶段2 · 步骤1 ｜ 明确问题</h2>
           <p className="text-gray-400 text-xs mt-1">问题从教师自评、多主体同伴评价与外部智慧教研系统反馈中提取；资料中无问题时由教师自主判断、手动输入（共 {problems.length} 条）</p>
@@ -296,6 +383,93 @@ export default function Stage1Problems({ session, problems, setProblems, onNext,
         >
           进入归因分析 →
         </button>
+      </div>
+        </div>
+
+        <aside className="sticky top-6 max-h-[calc(100vh-3rem)] flex flex-col rounded-xl border border-blue-200 bg-blue-50 p-4">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="w-10 h-10 rounded-full bg-blue-600 text-white flex items-center justify-center text-sm font-bold">AI</div>
+            <div>
+              <p className="text-base font-semibold text-blue-900">问题聚焦助手</p>
+              <p className="text-xs text-blue-700">基于证据判断并聚焦教学问题</p>
+            </div>
+          </div>
+
+          {!chatOpen ? (
+            <button
+              type="button"
+              onClick={() => setChatOpen(true)}
+              className="w-full px-3 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg"
+            >
+              打开对话面板
+            </button>
+          ) : (
+            <>
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-sm font-medium text-blue-900">对话面板</p>
+                <button
+                  type="button"
+                  onClick={() => setChatOpen(false)}
+                  className="text-xs text-blue-700 hover:underline"
+                >
+                  收起
+                </button>
+              </div>
+
+              <div className="bg-white border border-blue-100 rounded-lg p-3 flex-1 min-h-[140px] overflow-y-auto space-y-2">
+                {chatMessages.map((m, idx) => (
+                  <div
+                    key={`${m.role}-${idx}`}
+                    className={cn('text-sm px-3 py-2 rounded-lg whitespace-pre-wrap', m.role === 'assistant' ? 'bg-blue-50 text-blue-900' : 'bg-gray-100 text-gray-800')}
+                  >
+                    {m.content}
+                  </div>
+                ))}
+                {chatLoading && <p className="text-xs text-blue-600">问题聚焦助手正在思考…</p>}
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                {askTemplates.map(t => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => void sendChatMessage(t)}
+                    disabled={chatLoading}
+                    className="text-xs px-2.5 py-1.5 rounded-full border border-blue-200 text-blue-700 bg-white hover:bg-blue-50 disabled:opacity-40"
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+
+              <div className="mt-3 flex gap-2">
+                <textarea
+                  value={chatInput}
+                  onChange={e => setChatInput(e.target.value)}
+                  placeholder="输入你观察到的课堂现象、困惑或初步的问题想法…"
+                  rows={3}
+                  className="flex-1 border border-blue-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                      e.preventDefault()
+                      void sendChatMessage(chatInput)
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => void sendChatMessage(chatInput)}
+                  disabled={chatLoading || !chatInput.trim()}
+                  className="px-4 py-2 h-fit bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-sm rounded-lg"
+                >
+                  发送
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-gray-500">提示：按 Ctrl/⌘ + Enter 快速发送。助手仅围绕本节课材料聚焦问题，不提供长篇泛化分析；需要结构化问题时可输入“请输出问题”。</p>
+              {chatError && <p className="mt-2 text-sm text-red-600">{chatError}</p>}
+            </>
+          )}
+        </aside>
       </div>
     </div>
   )
