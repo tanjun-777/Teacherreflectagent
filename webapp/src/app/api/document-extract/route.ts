@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { isAllowedMediaUrl } from '@/lib/url-guard'
 import { signOwnedStorageUrl } from '@/lib/storage-sign'
+import { callVisionLLM, isVisionConfigured } from '@/lib/ai'
 
 export const runtime = 'nodejs'
 
@@ -9,6 +10,10 @@ type ExtractReq = {
   url?: string
   fileName?: string
 }
+
+// 文档内嵌图片识别：跳过小于该体积（字节）的 logo/装饰图；单文档最多识别张数（避免耗时与费用失控）
+const MIN_DOC_IMAGE_BYTES = 5 * 1024
+const MAX_DOC_IMAGES = 6
 
 function normalizeText(raw: string) {
   return raw
@@ -58,14 +63,41 @@ export async function POST(request: Request) {
     if (ext === 'txt') {
       text = new TextDecoder('utf-8').decode(buffer)
     } else if (ext === 'pdf') {
+      // PDF 仅提取文本层；含关键图片的 PDF 建议教师将图片另存后走图片上传识别通道
       const mod = await import('pdf-parse')
       const pdfParse = (mod.default ?? mod) as (dataBuffer: Buffer) => Promise<{ text?: string }>
       const parsed = await pdfParse(buffer)
       text = parsed.text ?? ''
     } else {
+      // docx：文本与 HTML 各解析一次（HTML 用于抽取内嵌图片的 base64）
       const mammoth = await import('mammoth')
-      const parsed = await mammoth.extractRawText({ buffer })
-      text = parsed.value ?? ''
+      const [raw, html] = await Promise.all([
+        mammoth.extractRawText({ buffer }).then(r => r.value ?? ''),
+        mammoth.convertToHtml({ buffer }).then(r => r.value ?? ''),
+      ])
+      text = raw
+
+      // 内嵌图片：过滤装饰小图 → 并发视觉识别 → 以【文档内图片N】段落并入文本
+      const docImages = [...html.matchAll(/<img[^>]*src="data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)"/g)]
+        .map(m => ({ mime: m[1], b64: m[2] }))
+        .filter(im => im.b64.length * 0.75 >= MIN_DOC_IMAGE_BYTES)
+        .slice(0, MAX_DOC_IMAGES)
+      if (docImages.length > 0 && isVisionConfigured()) {
+        const segments = await Promise.all(docImages.map(async (im, i) => {
+          try {
+            const content = await callVisionLLM(
+              '你是图片文字识别助手。',
+              '请提取这张图片中的全部文字内容；若无文字则用一句话简要描述图片内容。',
+              `data:${im.mime};base64,${im.b64}`
+            )
+            return `【文档内图片${i + 1}】\n${normalizeText(content) || '（未识别到内容）'}`
+          } catch {
+            // 单张失败不阻断文档解析整体
+            return `【文档内图片${i + 1}】（识别失败，可忽略）`
+          }
+        }))
+        text = `${text}\n\n${segments.join('\n\n')}`
+      }
     }
 
     const normalized = normalizeText(text)

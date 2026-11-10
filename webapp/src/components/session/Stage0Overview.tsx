@@ -1,10 +1,13 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import type { ReflectionSession } from '@/types'
 import { formatDate } from '@/lib/utils'
 import { updateDraftSnapshotFields } from '@/lib/session-audit'
 import { parseOwnedStoragePath } from '@/lib/storage-path'
+
+// 学生表现 / 学习结果模块保存的已确认图片引用（仅数据概览回看原图，不参与 AI 分析）
+type ImageRef = { name: string; url: string }
 
 interface Props {
   session: ReflectionSession
@@ -56,6 +59,8 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
   const snapshot = (session.draft_snapshot ?? {}) as {
     self_review_audio_url?: string
     peer_review_audio_url?: string
+    student_performance_images?: ImageRef[] | null
+    learning_outcomes_images?: ImageRef[] | null
   }
   const [preview, setPreview] = useState<PreviewData | null>(null)
   const [editing, setEditing] = useState<EditData | null>(null)
@@ -63,6 +68,24 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
   const [editError, setEditError] = useState('')
   const [uploadKind, setUploadKind] = useState<AudioKind | null>(null)
   const [actionMsg, setActionMsg] = useState('')
+  const [imageViewer, setImageViewer] = useState<{ name: string; src: string } | null>(null)
+  // 私有桶图片的签名地址（key 为原始 URL，1 小时有效）
+  const [signedImageSrcs, setSignedImageSrcs] = useState<Record<string, string>>({})
+
+  const perfImages = snapshot.student_performance_images ?? []
+  const outcomeImages = snapshot.learning_outcomes_images ?? []
+
+  useEffect(() => {
+    const urls = [...perfImages, ...outcomeImages].map(im => im.url)
+    if (urls.length === 0) return
+    let cancelled = false
+    void (async () => {
+      const entries = await Promise.all(urls.map(async u => [u, await signedFileSrc(u)] as const))
+      if (!cancelled) setSignedImageSrcs(Object.fromEntries(entries))
+    })()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.draft_snapshot])
 
   const hasData = session.teaching_design || session.self_review || session.peer_review || session.audio_url || session.audio_transcript
     || session.student_performance || session.learning_outcomes || session.external_feedback
@@ -71,11 +94,11 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
   const selfAudioPending = !!snapshot.self_review_audio_url && !session.self_review
   const peerAudioPending = !!snapshot.peer_review_audio_url && !session.peer_review
 
-  const items: Array<{ label: string; icon: string; field: string; value: string | null; audioPending?: boolean; audioUrl?: string | null; audioKind?: AudioKind }> = [
+  const items: Array<{ label: string; icon: string; field: string; value: string | null; audioPending?: boolean; audioUrl?: string | null; audioKind?: AudioKind; images?: ImageRef[] }> = [
     { label: '教学设计', icon: '📄', field: 'teaching_design', value: session.teaching_design },
     { label: '教师自评', icon: '✍️', field: 'self_review', value: session.self_review, audioPending: selfAudioPending, audioUrl: snapshot.self_review_audio_url ?? null, audioKind: 'self' },
-    { label: '学生表现', icon: '🧑‍🎓', field: 'student_performance', value: session.student_performance },
-    { label: '学习结果', icon: '📊', field: 'learning_outcomes', value: session.learning_outcomes },
+    { label: '学生表现', icon: '🧑‍🎓', field: 'student_performance', value: session.student_performance, images: perfImages.length > 0 ? perfImages : undefined },
+    { label: '学习结果', icon: '📊', field: 'learning_outcomes', value: session.learning_outcomes, images: outcomeImages.length > 0 ? outcomeImages : undefined },
     { label: '多主体同伴反馈', icon: '👥', field: 'peer_review', value: session.peer_review, audioPending: peerAudioPending, audioUrl: snapshot.peer_review_audio_url ?? null, audioKind: 'peer' },
     { label: '外部智慧教研系统反馈', icon: '🖥️', field: 'external_feedback', value: session.external_feedback },
   ]
@@ -101,8 +124,8 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
     await onSessionRefresh()
   }
 
-  // 存储桶为私有：播放前把本站录音 URL 换为 1 小时签名 URL（RLS 允许读取自己上传的文件）
-  async function signedAudioSrc(rawUrl: string): Promise<string> {
+  // 存储桶为私有：访问前把本站文件 URL（录音/图片等）换为 1 小时签名 URL（RLS 允许读取自己上传的文件）
+  async function signedFileSrc(rawUrl: string): Promise<string> {
     try {
       const parsed = parseOwnedStoragePath(rawUrl)
       if (!parsed) return rawUrl
@@ -115,7 +138,7 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
   }
 
   async function openPreview(title: string, text?: string | null, audioUrl?: string | null) {
-    const audioSrc = audioUrl ? await signedAudioSrc(audioUrl) : null
+    const audioSrc = audioUrl ? await signedFileSrc(audioUrl) : null
     setPreview({ title, text, audioUrl, audioSrc })
   }
 
@@ -238,6 +261,29 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
                 ) : (
                   <p className="text-xs text-gray-300 mt-0.5">未填写</p>
                 )}
+                {item.images && item.images.length > 0 && (
+                  <div className="flex gap-1.5 mt-1.5 flex-wrap">
+                    {item.images.map((img, i) => {
+                      const src = signedImageSrcs[img.url]
+                      return (
+                        <button
+                          key={`${img.url}-${i}`}
+                          type="button"
+                          onClick={() => src && setImageViewer({ name: img.name, src })}
+                          title={`查看原图：${img.name}`}
+                          className="shrink-0"
+                        >
+                          {src ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={src} alt={img.name} className="w-14 h-14 object-cover rounded border border-gray-200 hover:opacity-80 transition-opacity" />
+                          ) : (
+                            <span className="w-14 h-14 rounded border border-gray-200 bg-gray-50 flex items-center justify-center text-[10px] text-gray-400">加载中</span>
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <button
@@ -335,7 +381,12 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
       </button>
 
       {/* 资料编辑弹窗 */}
-      {editing && (
+      {editing && (() => {
+        // 学生表现 / 学习结果编辑时附带原图缩略图，供对照矫正识别文本（可选操作，非强制）
+        const editingImages = editing.field === 'student_performance' ? perfImages
+          : editing.field === 'learning_outcomes' ? outcomeImages
+          : []
+        return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => !saving && setEditing(null)}>
           <div className="absolute inset-0 bg-black/50" />
           <div
@@ -353,6 +404,32 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
               </button>
             </div>
             <div className="px-5 py-4 overflow-y-auto flex-1">
+              {editingImages.length > 0 && (
+                <div className="mb-3">
+                  <p className="text-xs font-medium text-gray-500 mb-1.5">🖼️ 原图参考（点击放大，可对照矫正识别文本，非必须）</p>
+                  <div className="flex gap-1.5 flex-wrap">
+                    {editingImages.map((img, i) => {
+                      const src = signedImageSrcs[img.url]
+                      return (
+                        <button
+                          key={`${img.url}-${i}`}
+                          type="button"
+                          onClick={() => src && setImageViewer({ name: img.name, src })}
+                          title={`查看原图：${img.name}`}
+                          className="shrink-0"
+                        >
+                          {src ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={src} alt={img.name} className="w-14 h-14 object-cover rounded border border-gray-200 hover:opacity-80 transition-opacity" />
+                          ) : (
+                            <span className="w-14 h-14 rounded border border-gray-200 bg-gray-50 flex items-center justify-center text-[10px] text-gray-400">加载中</span>
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
               <textarea
                 value={editing.value}
                 onChange={e => setEditing({ ...editing, value: e.target.value })}
@@ -380,7 +457,8 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
             </div>
           </div>
         </div>
-      )}
+        )
+      })()}
 
       {/* 资料预览弹窗 */}
       {preview && (
@@ -415,6 +493,32 @@ export default function Stage0Overview({ session, onAnalyze, loading, error, sta
                   <p className="text-sm text-amber-600">录音待转写，文本内容将在异步转写完成后显示</p>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 原图查看弹窗 */}
+      {imageViewer && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setImageViewer(null)}>
+          <div className="absolute inset-0 bg-black/50" />
+          <div
+            className="relative bg-white rounded-xl shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-3.5 border-b border-gray-100 shrink-0">
+              <h3 className="font-semibold text-gray-900 truncate" title={imageViewer.name}>{imageViewer.name}</h3>
+              <button
+                onClick={() => setImageViewer(null)}
+                className="text-gray-400 hover:text-gray-600 text-xl leading-none"
+                aria-label="关闭原图"
+              >
+                ×
+              </button>
+            </div>
+            <div className="px-5 py-4 overflow-auto flex-1 flex items-center justify-center">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={imageViewer.src} alt={imageViewer.name} className="max-w-full max-h-[60vh] object-contain rounded" />
             </div>
           </div>
         </div>
