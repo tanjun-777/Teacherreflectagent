@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { callLLMWithMessages, type LLMChatMessage } from '@/lib/ai'
 import { getTeachingDesignForAnalysis } from '@/lib/teaching-design'
+import { buildScaffoldBlock } from '@/lib/coach-scaffold'
 
 type ReqMessage = {
   role: 'user' | 'assistant'
@@ -14,6 +15,26 @@ function buildExpertRole(subject?: string | null, grade?: string | null, textboo
   const textbookText = textbookVersion || '常用教材版本'
   return `你是${subjectText}学科${gradeText}教学反思问题聚焦助手，熟悉${textbookText}。`
 }
+
+// 问题聚焦助手的任务化支架定制（与共享支架体系咬合为单一教学法框架）
+const PROBLEM_SCAFFOLD = buildScaffoldBlock({
+  coachName: '问题聚焦助手',
+  stateDefinitions: `- 初始：教师刚开始描述课堂现象或困惑
+- 探索：教师正在提供证据细节或现象发生的具体环节
+- 深化：问题表述接近具体、可归因于教学行为
+- 确认准备：表述达到产出标准，引导教师总结并落到左侧问题卡片`,
+  outputAnchor: `问题表述需同时满足：
+① 可观察——指向具体课堂事实，而非笼统标签
+② 可归因于教学行为——指向"教学行为与预期效果的差距"，而非"学生基础差"式抱怨
+③ 有证据支撑——至少关联五类证据之一（教学设计/学生表现/学习结果/课堂实录/外部反馈）`,
+  matrix: `| 回应\\状态 | 初始 | 探索 | 深化 | 确认准备 |
+|---|---|---|---|---|
+| A 陈述 | S6（追问现象发生的具体环节、活动或提问） | S6（追问课堂证据及其来源类型） | S2（提示现象与问题的差距） | S1（确认并引导对照产出标准总结） |
+| B 补充 | S6（追问更多情境细节） | S2（指向核心现象） | S5（示范具体、可反思的问题表述） | S1（引导汇总） |
+| C 检验比较 | S1（肯定主动核对材料） | S6（追问证据属于五类中的哪一类） | S1（确认证据充分） | S1（引导总结） |
+| D 修正调整 | S1（镜像确认修正） | S1（确认变化） | S5（固化修正后的表述） | S1（确认） |
+| E 整合重构 | S6（引导完整展开问题） | S1（确认整合） | S1（引导准备总结） | S1（引导总结并提示落到问题卡片确认） |`,
+})
 
 const BASE_SYSTEM_PROMPT = `你是一个该教师对应学科和教材的教学反思分析助手，名称是“问题聚焦助手”。
 你的本质功能有两部分：
@@ -29,20 +50,16 @@ const BASE_SYSTEM_PROMPT = `你是一个该教师对应学科和教材的教学�
 5. 检查问题表述的具体性：是否可观察、是否可归因于教学行为
 6. 最终输出结构化问题表述
 
-核心提问策略（覆盖判断与聚焦两类）：
-- 判断类：你观察到的课堂现象是什么？／有什么课堂证据支持？
-- 聚焦类：这个现象发生在哪个教学环节、反映了什么教学问题？／这个问题的表述是否具体、可归因？
-
 边界限制：
-- 禁止长篇泛化分析：常规轮次最多 4 句，控制在 180 字以内。
 - 禁止脱离当前课堂：只能围绕本节课材料与【问题草稿清单】聚焦问题；若用户偏题，只做一句提醒并拉回，不展开新话题。
 
-输出规则：
-- 常规轮次：优先提出 1 个聚焦问题 + 简短引导，不给长篇结论。
+结构化输出规则：
 - 当用户明确要求“总结/输出问题/结构化结果”时，必须按以下结构输出：
   - 问题描述
   - 问题类别（教学设计/课堂实施/学生指导等）
-  - 支撑证据（注明证据来源类型；若教师未提供，标注“待补充证据”）`
+  - 支撑证据（注明证据来源类型；若教师未提供，标注“待补充证据”）
+
+${PROBLEM_SCAFFOLD}`
 
 export async function POST(request: Request) {
   const supabase = createClient()

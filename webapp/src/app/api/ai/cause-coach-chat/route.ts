@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { callLLMWithMessages, type LLMChatMessage } from '@/lib/ai'
 import { getTeachingDesignForAnalysis } from '@/lib/teaching-design'
+import { buildScaffoldBlock } from '@/lib/coach-scaffold'
 
 type ReqMessage = {
   role: 'user' | 'assistant'
@@ -14,6 +15,26 @@ function buildExpertRole(subject?: string | null, grade?: string | null, textboo
   const textbookText = textbookVersion || '常用教材版本'
   return `你是${subjectText}学科${gradeText}教学反思归因分析助手，熟悉${textbookText}。`
 }
+
+// 归因分析助手的任务化支架定制（与共享支架体系咬合为单一教学法框架）
+const CAUSE_SCAFFOLD = buildScaffoldBlock({
+  coachName: '归因分析助手',
+  stateDefinitions: `- 初始：教师刚开始谈论聚焦问题
+- 探索：教师正在给出候选原因
+- 深化：归因接近锚定本节课的具体证据
+- 确认准备：归因锚定证据且机制清晰，引导教师总结并落到左侧归因卡片`,
+  outputAnchor: `归因表述需同时满足：
+① 锚定本节课的具体证据——至少关联五类证据之一（教学设计/学生表现/学习结果/课堂实录/外部反馈），能指出"是哪个环节的什么表现"；脱离本节课仍然成立的归因视为泛化
+② 指明作用机制——说明该因素为何导致该问题
+③ 区分了类别——教学设计因素 / 环境因素 / 教师自身因素 / 学生因素`,
+  matrix: `| 回应\\状态 | 初始 | 探索 | 深化 | 确认准备 |
+|---|---|---|---|---|
+| A 陈述 | S6（引导回到聚焦问题的具体现象） | S6（追问"为什么"再往下一层） | S2（提示归因须锚定本节课证据） | S1（引导对照产出标准总结归因） |
+| B 补充 | S6（追问课堂证据） | S4（提供归因类别框架：教学设计/环境/教师自身/学生） | S5（示范"证据→机制→归因"的表述） | S1（引导汇总） |
+| C 检验比较 | S1（肯定主动检验） | S4（提供对比框架，比较候选原因的解释力） | S1（确认深度足够） | S1（引导总结） |
+| D 修正调整 | S1（确认修正） | S5（示范修正后的归因表述） | S1（确认） | S1（确认） |
+| E 整合重构 | S6（引导展开完整因果链） | S1（确认整合） | S1（引导准备总结） | S1（引导总结并提示落到归因卡片确认） |`,
+})
 
 const BASE_SYSTEM_PROMPT = `你是一个该教师对应学科和教材的教学反思分析助手，名称是“归因分析助手”。
 本质功能是：帮助教师分析教学问题的原因。
@@ -29,23 +50,17 @@ const BASE_SYSTEM_PROMPT = `你是一个该教师对应学科和教材的教学�
 4. 要求用户提供课堂证据
 5. 最终输出结构化归因结果
 
-核心提问策略（至少覆盖）：
-- 你观察到的具体现象是什么？
-- 你认为它属于哪一类问题？
-- 可能的根本原因是什么？
-- 有什么课堂证据支持？
-
 边界限制：
-- 禁止长篇泛化分析：常规轮次最多 4 句，控制在 180 字以内。
 - 禁止脱离当前阶段问题：只能围绕【当前聚焦问题】归因；若用户偏题，只做一句提醒并拉回，不展开新话题。
 
-输出规则：
-- 常规轮次：优先提出 1 个聚焦问题 + 简短引导，不给长篇结论。
+结构化输出规则：
 - 当用户明确要求“总结/输出归因结果/结构化结果”时，必须按以下结构输出：
   - 问题描述
   - 一级归因（类别）
   - 二级归因（机制）
-  - 支撑证据`
+  - 支撑证据
+
+${CAUSE_SCAFFOLD}`
 
 export async function POST(request: Request) {
   const supabase = createClient()

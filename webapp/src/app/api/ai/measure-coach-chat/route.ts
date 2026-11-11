@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { callLLMWithMessages, type LLMChatMessage } from '@/lib/ai'
 import { getTeachingDesignForAnalysis } from '@/lib/teaching-design'
+import { buildScaffoldBlock } from '@/lib/coach-scaffold'
 
 type ReqMessage = {
   role: 'user' | 'assistant'
@@ -14,6 +15,27 @@ function buildExpertRole(subject?: string | null, grade?: string | null, textboo
   const textbookText = textbookVersion || '常用教材版本'
   return `你是${subjectText}学科${gradeText}教学改进设计助手，熟悉${textbookText}。`
 }
+
+// 解决措施助手的任务化支架定制（与共享支架体系咬合为单一教学法框架）
+const MEASURE_SCAFFOLD = buildScaffoldBlock({
+  coachName: '解决措施助手',
+  stateDefinitions: `- 初始：教师刚开始设想改进方向
+- 探索：教师已有措施雏形
+- 深化：措施接近具体可执行
+- 确认准备：措施落到具体环节且可验证，引导教师总结并落到左侧措施卡片`,
+  outputAnchor: `措施表述需同时满足：
+① 落到本课的具体教学环节——说明在哪个环节实施
+② 含可执行要素——时间、步骤、对象
+③ 有验证方式——如何判断措施有效
+④ 直接回应归因——针对【当前聚焦归因】设计，而非泛化建议`,
+  matrix: `| 回应\\状态 | 初始 | 探索 | 深化 | 确认准备 |
+|---|---|---|---|---|
+| A 陈述 | S3（引导具体化：在哪个环节、分几步） | S6（追问实施细节：时间/步骤/对象） | S2（提示验证方式） | S1（引导对照产出标准总结措施） |
+| B 补充 | S3（引导步骤化表述） | S6（追问现实可行性与约束） | S5（示范结构化的措施表述） | S1（引导汇总） |
+| C 检验比较 | S1（肯定主动比较方案） | S6（追问如何验证哪个更有效） | S1（确认可行） | S1（引导总结） |
+| D 修正调整 | S1（确认调整） | S5（帮助重新表述修正后的措施） | S1（确认） | S1（确认） |
+| E 整合重构 | S1（确认整合） | S5（帮助形成步骤完整的系统性措施） | S1（引导准备总结） | S1（引导总结并提示落到措施卡片确认） |`,
+})
 
 const BASE_SYSTEM_PROMPT = `你是一个教学改进设计助手，名称是“解决措施助手”。
 任务是帮助教师将已识别的问题原因转化为具体可执行的教学改进策略。
@@ -28,21 +50,15 @@ const BASE_SYSTEM_PROMPT = `你是一个教学改进设计助手，名称是“�
 4. 检查现实可行性
 5. 输出结构化改进措施
 
-核心提问策略（至少覆盖）：
-- 你打算如何具体调整教学？
-- 这个措施在课堂哪个环节实施？
-- 谁来执行这个步骤？
-- 如何验证是否有效？
-
 边界限制：
-- 禁止长篇泛化分析：常规轮次最多 4 句，控制在 180 字以内。
-- 禁止脱离当前阶段问题：只能围绕【当前聚焦问题】与【当前聚焦归因】设计措施；若用户偏题，只做一句提醒并拉回，不展开新话题。
+- 禁止提供泛化建议：必须围绕【当前聚焦问题】与【当前聚焦归因】设计措施；若用户偏题，只做一句提醒并拉回，不展开新话题。
 
-输出规则：
-- 常规轮次：优先提出 1 个行动化追问 + 简短引导，不给长篇结论。
+结构化输出规则：
 - 当用户明确要求“总结/输出措施/结构化措施”时，必须按以下结构输出：
   - 问题的原因
-  - 具体措施（步骤化）`
+  - 具体措施（步骤化）
+
+${MEASURE_SCAFFOLD}`
 
 export async function POST(request: Request) {
   const supabase = createClient()
